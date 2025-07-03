@@ -1,11 +1,14 @@
-
-// debug-server.js - Create this file to test routes one by one
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
+import mongoose from 'mongoose';
 import cookieParser from 'cookie-parser';
+import authRoutes from './src/routes/authRoutes.js';
+import sheetRoutes from "./src/routes/sheetRoutes.js";
+import { connectDBWithRetry } from './src/config/db.js';
 
 dotenv.config();
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -38,34 +41,89 @@ app.use(cors(corsOptions));
 app.use(cookieParser());
 app.use(express.json());
 
-// Test basic route first
-app.get('/test', (req, res) => {
-    res.json({ message: 'Server is working' });
+// Health check endpoint
+app.get('/health', (req, res) => {
+    const dbState = mongoose.connection.readyState;
+    const dbStatus = {
+        0: 'disconnected',
+        1: 'connected',
+        2: 'connecting',
+        3: 'disconnecting'
+    };
+    
+    res.json({ 
+        status: 'OK', 
+        database: dbStatus[dbState],
+        timestamp: new Date().toISOString() 
+    });
 });
 
-console.log('Basic server setup complete, testing auth routes...');
-
-// Test 1: Try loading auth routes
-try {
-    const authRoutes = await import('./src/routes/authRoutes.js');
-    console.log('✅ Auth routes imported successfully');
-    app.use('/auth', authRoutes.default);
-    console.log('✅ Auth routes mounted successfully');
-} catch (error) {
-    console.error('❌ Error with auth routes:', error.message);
-}
-
-// Test 2: Try loading sheet routes
-try {
-    const sheetRoutes = await import('./src/routes/sheetRoutes.js');
-    console.log('✅ Sheet routes imported successfully');
-    app.use('/api/sheets', sheetRoutes.default);
-    console.log('✅ Sheet routes mounted successfully');
-} catch (error) {
-    console.error('❌ Error with sheet routes:', error.message);
-    console.error('This is likely where the problem is!');
-}
-
-app.listen(PORT, () => {
-    console.log("Debug server running on PORT:" + PORT);
+// Debug endpoint
+app.get('/debug/cookies', (req, res) => {
+    res.cookie('test-cookie', 'test-value', {
+        httpOnly: false,
+        secure: false,
+        sameSite: 'lax',
+        maxAge: 60000
+    });
+    
+    res.json({
+        message: 'Debug endpoint',
+        cookies: req.cookies,
+        origin: req.get('origin')
+    });
 });
+
+// Routes
+app.use('/auth', authRoutes);
+app.use('/api/sheets', sheetRoutes);
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+    console.error('Global error:', error);
+    
+    if (error.name === 'MongooseError' || error.name === 'MongoError') {
+        return res.status(503).json({ 
+            message: 'Database temporarily unavailable',
+            code: 'DB_ERROR'
+        });
+    }
+    
+    res.status(500).json({ 
+        message: 'Internal server error',
+        code: 'SERVER_ERROR'
+    });
+});
+
+// Start server and connect to database
+const startServer = async () => {
+    try {
+        // Connect to MongoDB first
+        await connectDBWithRetry();
+        
+        // Start server after successful DB connection
+        app.listen(PORT, () => {
+            console.log(`🚀 Server running on PORT: ${PORT}`);
+            console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+        });
+        
+    } catch (error) {
+        console.error('💥 Failed to start server:', error);
+        process.exit(1);
+    }
+};
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+    console.log('📴 Shutting down gracefully...');
+    try {
+        await mongoose.connection.close();
+        console.log('✅ MongoDB connection closed');
+        process.exit(0);
+    } catch (error) {
+        console.error('❌ Error during shutdown:', error);
+        process.exit(1);
+    }
+});
+
+startServer();
