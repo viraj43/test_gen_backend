@@ -1,11 +1,9 @@
+
+// debug-server.js - Create this file to test routes one by one
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import mongoose from 'mongoose';
 import cookieParser from 'cookie-parser';
-import authRoutes from './src/routes/authRoutes.js'
-import sheetRoutes from "./src/routes/sheetRoutes.js"
-import { connectDB } from './src/config/db.js';
 
 dotenv.config();
 const app = express();
@@ -13,14 +11,13 @@ const PORT = process.env.PORT || 3000;
 
 const corsOptions = {
     origin: function (origin, callback) {
-        // Allow requests with no origin (like mobile apps or curl requests)
         if (!origin) return callback(null, true);
         
         const allowedOrigins = [
             'https://test-gen-frontend.onrender.com',
             'http://localhost:3000',
             'http://localhost:3001',
-            'http://localhost:5173', // Common Vite dev server port
+            'http://localhost:5173',
             'http://localhost:5174'
         ];
         
@@ -30,30 +27,45 @@ const corsOptions = {
             callback(new Error('Not allowed by CORS'));
         }
     },
-    credentials: true, // This is crucial for cookies
+    credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    exposedHeaders: ['Set-Cookie'], // Expose Set-Cookie header
-    optionsSuccessStatus: 200, // Some legacy browsers choke on 204
+    exposedHeaders: ['Set-Cookie'],
+    optionsSuccessStatus: 200,
 };
 
-// Apply CORS before other middleware
 app.use(cors(corsOptions));
+app.use(cookieParser());
+app.use(express.json());
 
-// Handle preflight requests explicitly
-app.options('*', cors(corsOptions));
+// Test basic route first
+app.get('/test', (req, res) => {
+    res.json({ message: 'Server is working' });
+});
 
-// Middleware Configuration
-app.use(cookieParser()); // Ensure cookie parsing middleware is set
-app.use(express.json());  // Parse JSON request bodies
+console.log('Basic server setup complete, testing auth routes...');
 
- // Use CORS with the provided 
+// Test 1: Try loading auth routes
+try {
+    const authRoutes = await import('./src/routes/authRoutes.js');
+    console.log('✅ Auth routes imported successfully');
+    app.use('/auth', authRoutes.default);
+    console.log('✅ Auth routes mounted successfully');
+} catch (error) {
+    console.error('❌ Error with auth routes:', error.message);
+}
 
-app.use("/auth/",authRoutes)
-app.use('/api/sheets', sheetRoutes);
-app.use('/api', sheetRoutes);
- // Connect to MongoDB
+// Test 2: Try loading sheet routes
+try {
+    const sheetRoutes = await import('./src/routes/sheetRoutes.js');
+    console.log('✅ Sheet routes imported successfully');
+    app.use('/api/sheets', sheetRoutes.default);
+    console.log('✅ Sheet routes mounted successfully');
+} catch (error) {
+    console.error('❌ Error with sheet routes:', error.message);
+    console.error('This is likely where the problem is!');
+}
+
 app.listen(PORT, () => {
-    console.log("server is running on PORT:" + PORT);
-    connectDB();
+    console.log("Debug server running on PORT:" + PORT);
 });
