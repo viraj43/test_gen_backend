@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 const corsOptions = {
-  origin: 'test-gen-frontend-1yzz.vercel.app', // The URL of your frontend app
+  origin: 'https://test-gen-frontend.onrender.com', // The URL of your frontend app
   credentials: true,  // Ensure cookies are allowed to be sent with requests
 };
 
