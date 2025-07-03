@@ -23,7 +23,8 @@ const corsOptions = {
             'http://localhost:3001',
             'http://localhost:5173',
             'http://localhost:4173',
-            'http://localhost:5174'
+            'http://localhost:5174',
+            'https://ttest123ab.netlify.app'
         ];
         
         if (allowedOrigins.includes(origin)) {
