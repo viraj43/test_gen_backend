@@ -918,21 +918,28 @@ function parseTestScenariosJSON(text) {
     return getFallbackTestScenarios();
 }
 
+
 function validateAndCleanTestScenarios(scenarios) {
     return scenarios.map((scenario, index) => ({
         id: scenario.id || `TS_${(index + 1)}`,
         module: scenario.module || '',
-        description: scenario.description || `Test Scenario ${index + 1} Description`
-    })).filter(scenario => scenario.description);
+        condition: scenario.condition || '',
+        testScenarios: scenario.testScenarios || scenario.description || `Test Scenario ${index + 1} Description`,
+        status: scenario.status || 'Not Tested'
+    })).filter(scenario => scenario.testScenarios);
 }
 
 function getFallbackTestScenarios() {
     const fallbackScenarios = [];
+    const conditions = ['Using Valid Credentials for Login', 'Using Invalid Credentials for Login', 'Forgot Password', 'Language Change', 'Attempt with empty fields'];
+
     for (let i = 1; i <= 10; i++) {
         fallbackScenarios.push({
             id: `TS_${i}`,
             module: 'Test Module',
-            description: `Test Scenario ${i}: End-to-end workflow testing for the module functionality`
+            condition: conditions[(i - 1) % conditions.length] || 'Default Condition',
+            testScenarios: `Test Scenario ${i}: End-to-end workflow testing for the module functionality`,
+            status: 'Not Tested'
         });
     }
     return fallbackScenarios;
@@ -1201,21 +1208,31 @@ function getFallbackTestCases() {
 
 export const generateTestCasesWithOptions = async (req, res) => {
     try {
-        const { 
-            module, 
-            summary, 
-            acceptanceCriteria, 
-            spreadsheetId, 
+        const {
+            module,
+            summary,
+            acceptanceCriteria,
+            spreadsheetId,
             generateTestCases = true,
             generateTestScenarios = true,
             testCasesCount = 20,
-            testScenariosCount = 10
+            testScenariosCount = 10,
+            // NEW: Sheet selection options
+            testCasesSheetName = null,  // If provided, append to existing sheet
+            testScenariosSheetName = null  // If provided, append to existing sheet
         } = req.body;
-        
+
         const userId = req.user._id.toString();
 
         console.log("🔧 Generate with options for user:", userId);
-        console.log("📋 Options:", { generateTestCases, generateTestScenarios, testCasesCount, testScenariosCount });
+        console.log("📋 Options:", {
+            generateTestCases,
+            generateTestScenarios,
+            testCasesCount,
+            testScenariosCount,
+            testCasesSheetName,
+            testScenariosSheetName
+        });
 
         const userToken = await UserToken.findOne({ userId: userId });
         if (!userToken) {
@@ -1233,7 +1250,7 @@ export const generateTestCasesWithOptions = async (req, res) => {
 
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
         const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
-        
+
         let testCases = [];
         let testScenarios = [];
         let createdSheets = [];
@@ -1292,33 +1309,46 @@ Return ONLY the JSON array with exactly ${testCasesCount} test cases, no markdow
             testCases = parseGeminiJSON(testCasesText);
 
             if (testCases.length > 0) {
-                const testCasesSheetName = `Test Cases - ${module} - ${timestamp}`;
-                
-                // Create test cases sheet
-                await sheets.spreadsheets.batchUpdate({
-                    spreadsheetId,
-                    requestBody: {
-                        requests: [{
-                            addSheet: {
-                                properties: {
-                                    title: testCasesSheetName,
-                                    gridProperties: {
-                                        rowCount: 100,
-                                        columnCount: 10
+                let finalTestCasesSheetName;
+
+                // Check if user wants to append to existing sheet
+                if (testCasesSheetName && testCasesSheetName.trim()) {
+                    finalTestCasesSheetName = testCasesSheetName.trim();
+                    console.log("📝 Appending test cases to existing sheet:", finalTestCasesSheetName);
+
+                    // Append to existing sheet
+                    await appendTestCasesToExistingSheet(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
+                } else {
+                    // Create new sheet
+                    finalTestCasesSheetName = `Test Cases - ${module} - ${timestamp}`;
+                    console.log("📝 Creating new test cases sheet:", finalTestCasesSheetName);
+
+                    await sheets.spreadsheets.batchUpdate({
+                        spreadsheetId,
+                        requestBody: {
+                            requests: [{
+                                addSheet: {
+                                    properties: {
+                                        title: finalTestCasesSheetName,
+                                        gridProperties: {
+                                            rowCount: 100,
+                                            columnCount: 10
+                                        }
                                     }
                                 }
-                            }
-                        }]
-                    }
-                });
+                            }]
+                        }
+                    });
 
-                // Add test cases data and formatting
-                await addTestCasesSheetData(sheets, spreadsheetId, testCasesSheetName, testCases, module);
-                
+                    // Add test cases data and formatting to new sheet
+                    await addTestCasesSheetData(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
+                }
+
                 createdSheets.push({
                     type: 'testCases',
-                    name: testCasesSheetName,
-                    count: testCases.length
+                    name: finalTestCasesSheetName,
+                    count: testCases.length,
+                    action: testCasesSheetName ? 'appended' : 'created'
                 });
             }
         }
@@ -1332,30 +1362,40 @@ Module: ${module}
 Summary: ${summary}
 Acceptance Criteria: ${acceptanceCriteria}
 
-Create EXACTLY ${testScenariosCount} high-level test scenarios in valid JSON format. Each test scenario must follow this exact structure:
+Create EXACTLY ${testScenariosCount} test scenarios in valid JSON format. Each test scenario must follow this exact structure:
 
 [
   {
     "id": "TS_1",
     "module": "${module}",
-    "description": "High-level description of the test scenario covering a complete user workflow or business process"
+    "condition": "Specific condition or state for this test scenario",
+    "testScenarios": "Detailed description of the test scenario covering a complete user workflow or business process",
+    "status": "Not Tested"
   }
 ]
 
 IMPORTANT REQUIREMENTS:
 1. Use EXACTLY the ID format: TS_1, TS_2, TS_3, ..., TS_${testScenariosCount}
 2. Module field should always be: "${module}"
-3. Each scenario should cover a complete end-to-end workflow
-4. Focus on business processes and user journeys
-5. Scenarios should be broader than individual test cases
-6. Cover different user roles, permissions, and use cases
-7. Include both happy path and error scenarios
-8. Each description should be 1-2 sentences explaining the complete workflow
+3. Condition should describe the specific state, input, or situation being tested
+4. testScenarios should be a detailed description of the complete workflow
+5. Status should always be "Not Tested" for all scenarios
+6. Cover different conditions like:
+   - Valid/Invalid inputs
+   - Different user states (logged in/guest)
+   - Various system conditions
+   - Error scenarios
+   - Edge cases
 
 Examples of good test scenarios:
-- "Complete user registration and email verification workflow"
-- "End-to-end payment processing with multiple payment methods"
-- "User login with various authentication failure scenarios"
+- Condition: "Using Valid Credentials for Login"
+  Test Scenario: "Successful login with valid email and password, followed by navigation to the main dashboard."
+  
+- Condition: "Using Invalid Credentials for Login" 
+  Test Scenario: "Login failure due to incorrect password, verifying error message display and retry functionality."
+
+- Condition: "Forgot Password"
+  Test Scenario: "Successful password reset starting from the Forgot Password link to successful login with new password."
 
 Return ONLY the JSON array with exactly ${testScenariosCount} test scenarios, no markdown formatting, no code blocks, no additional text.
 `;
@@ -1367,33 +1407,46 @@ Return ONLY the JSON array with exactly ${testScenariosCount} test scenarios, no
             testScenarios = parseTestScenariosJSON(testScenariosText);
 
             if (testScenarios.length > 0) {
-                const testScenariosSheetName = `Test Scenarios - ${module} - ${timestamp}`;
-                
-                // Create test scenarios sheet
-                await sheets.spreadsheets.batchUpdate({
-                    spreadsheetId,
-                    requestBody: {
-                        requests: [{
-                            addSheet: {
-                                properties: {
-                                    title: testScenariosSheetName,
-                                    gridProperties: {
-                                        rowCount: 50,
-                                        columnCount: 3
+                let finalTestScenariosSheetName;
+
+                // Check if user wants to append to existing sheet
+                if (testScenariosSheetName && testScenariosSheetName.trim()) {
+                    finalTestScenariosSheetName = testScenariosSheetName.trim();
+                    console.log("📝 Appending test scenarios to existing sheet:", finalTestScenariosSheetName);
+
+                    // Append to existing sheet
+                    await appendTestScenariosToExistingSheet(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
+                } else {
+                    // Create new sheet
+                    finalTestScenariosSheetName = `Test Scenarios - ${module} - ${timestamp}`;
+                    console.log("📝 Creating new test scenarios sheet:", finalTestScenariosSheetName);
+
+                    await sheets.spreadsheets.batchUpdate({
+                        spreadsheetId,
+                        requestBody: {
+                            requests: [{
+                                addSheet: {
+                                    properties: {
+                                        title: finalTestScenariosSheetName,
+                                        gridProperties: {
+                                            rowCount: 50,
+                                            columnCount: 3
+                                        }
                                     }
                                 }
-                            }
-                        }]
-                    }
-                });
+                            }]
+                        }
+                    });
 
-                // Add test scenarios data and formatting
-                await addTestScenariosSheetData(sheets, spreadsheetId, testScenariosSheetName, testScenarios, module);
-                
+                    // Add test scenarios data and formatting to new sheet
+                    await addTestScenariosSheetData(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
+                }
+
                 createdSheets.push({
                     type: 'testScenarios',
-                    name: testScenariosSheetName,
-                    count: testScenarios.length
+                    name: finalTestScenariosSheetName,
+                    count: testScenarios.length,
+                    action: testScenariosSheetName ? 'appended' : 'created'
                 });
             }
         }
@@ -1405,7 +1458,7 @@ Return ONLY the JSON array with exactly ${testScenariosCount} test scenarios, no
             testCases: generateTestCases ? testCases : [],
             testScenarios: generateTestScenarios ? testScenarios : [],
             createdSheets,
-            message: `Successfully generated ${generateTestCases ? `${testCases.length} test cases` : ''}${generateTestCases && generateTestScenarios ? ' and ' : ''}${generateTestScenarios ? `${testScenarios.length} test scenarios` : ''}`
+            message: `Successfully ${createdSheets.map(s => `${s.action} ${s.count} ${s.type === 'testCases' ? 'test cases' : 'test scenarios'} ${s.action === 'appended' ? 'to' : 'in'} "${s.name}"`).join(' and ')}`
         });
 
     } catch (error) {
@@ -1416,6 +1469,89 @@ Return ONLY the JSON array with exactly ${testScenariosCount} test scenarios, no
         });
     }
 };
+
+// NEW: Function to append test cases to existing sheet
+async function appendTestCasesToExistingSheet(sheets, spreadsheetId, sheetName, testCases, module) {
+    try {
+        // Get existing data to find the next available row
+        const existingData = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `'${sheetName}'!A:J`,
+        });
+
+        const existingRows = existingData.data.values || [];
+        const nextRow = existingRows.length + 1;
+
+        console.log(`📍 Appending ${testCases.length} test cases starting at row ${nextRow}`);
+
+        // Prepare new test case data (without header)
+        const newTestCasesData = testCases.map(testCase => [
+            testCase.id || '',
+            testCase.module || module,
+            testCase.submodule || '',
+            testCase.summary || '',
+            testCase.testSteps || '',
+            testCase.expectedResults || '',
+            '', // Actual Result - empty initially
+            testCase.testCaseType || 'Positive',
+            testCase.environment || 'Test',
+            testCase.status || 'Not Tested'
+        ]);
+
+        // Append the new data
+        await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `'${sheetName}'!A${nextRow}`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values: newTestCasesData }
+        });
+
+        console.log("✅ Test cases appended successfully");
+        return true;
+    } catch (error) {
+        console.error('Error appending test cases:', error);
+        throw error;
+    }
+}
+
+// NEW: Function to append test scenarios to existing sheet
+async function appendTestScenariosToExistingSheet(sheets, spreadsheetId, sheetName, testScenarios, module) {
+    try {
+        // Get existing data to find the next available row
+        const existingData = await sheets.spreadsheets.values.get({
+            spreadsheetId,
+            range: `'${sheetName}'!A:D`,  // Updated to 4 columns
+        });
+
+        const existingRows = existingData.data.values || [];
+        const nextRow = existingRows.length + 1;
+
+        console.log(`📍 Appending ${testScenarios.length} test scenarios starting at row ${nextRow}`);
+
+        // Prepare new test scenario data (without header) - Updated format
+        const newTestScenariosData = testScenarios.map(scenario => [
+            scenario.module || module,
+            scenario.condition || '',
+            scenario.testScenarios || '',
+            scenario.status || 'Not Tested'
+        ]);
+
+        // Append the new data
+        await sheets.spreadsheets.values.update({
+            spreadsheetId,
+            range: `'${sheetName}'!A${nextRow}`,
+            valueInputOption: 'USER_ENTERED',
+            requestBody: { values: newTestScenariosData }
+        });
+
+        console.log("✅ Test scenarios appended successfully");
+        return true;
+    } catch (error) {
+        console.error('Error appending test scenarios:', error);
+        throw error;
+    }
+}
+
 
 // Helper function to add test cases sheet data
 async function addTestCasesSheetData(sheets, spreadsheetId, sheetName, testCases, module) {
@@ -1856,17 +1992,19 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
     const sheet = spreadsheetInfo.data.sheets.find(s => s.properties.title === sheetName);
     const sheetId = sheet.properties.sheetId;
 
-    // Prepare Test Scenarios Sheet Data
+    // Updated Test Scenarios Sheet Data with new format
     const testScenariosHeaderRow = [
-        'Test Scenario Id',
         'Module',
-        'Test Scenario Description'
+        'Condition', 
+        'Test Scenarios',
+        'Status'
     ];
 
     const testScenariosDataRows = testScenarios.map(scenario => [
-        scenario.id || '',
         scenario.module || module,
-        scenario.description || ''
+        scenario.condition || '',
+        scenario.testScenarios || '',
+        scenario.status || 'Not Tested'
     ]);
 
     const testScenariosAllData = [testScenariosHeaderRow, ...testScenariosDataRows];
@@ -1879,7 +2017,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
         requestBody: { values: testScenariosAllData }
     });
 
-    // Apply formatting to Test Scenarios Sheet
+    // Updated formatting for Test Scenarios Sheet with 4 columns
     const testScenariosFormatRequests = [
         // Format header row - same style as test cases
         {
@@ -1889,7 +2027,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                     startRowIndex: 0,
                     endRowIndex: 1,
                     startColumnIndex: 0,
-                    endColumnIndex: 3
+                    endColumnIndex: 4  // Updated to 4 columns
                 },
                 cell: {
                     userEnteredFormat: {
@@ -1920,7 +2058,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                 fields: 'userEnteredFormat'
             }
         },
-        // Better column widths for scenarios sheet
+        // Updated column widths for 4 columns
         {
             updateDimensionProperties: {
                 range: {
@@ -1929,7 +2067,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                     startIndex: 0,
                     endIndex: 1
                 },
-                properties: { pixelSize: 180 },
+                properties: { pixelSize: 150 },  // Module
                 fields: 'pixelSize'
             }
         },
@@ -1941,7 +2079,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                     startIndex: 1,
                     endIndex: 2
                 },
-                properties: { pixelSize: 150 },
+                properties: { pixelSize: 250 },  // Condition
                 fields: 'pixelSize'
             }
         },
@@ -1953,7 +2091,19 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                     startIndex: 2,
                     endIndex: 3
                 },
-                properties: { pixelSize: 500 },
+                properties: { pixelSize: 400 },  // Test Scenarios
+                fields: 'pixelSize'
+            }
+        },
+        {
+            updateDimensionProperties: {
+                range: {
+                    sheetId: sheetId,
+                    dimension: 'COLUMNS',
+                    startIndex: 3,
+                    endIndex: 4
+                },
+                properties: { pixelSize: 100 },  // Status
                 fields: 'pixelSize'
             }
         },
@@ -1990,7 +2140,7 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                     startRowIndex: 1,
                     endRowIndex: testScenarios.length + 1,
                     startColumnIndex: 0,
-                    endColumnIndex: 3
+                    endColumnIndex: 4  // Updated to 4 columns
                 },
                 cell: {
                     userEnteredFormat: {
@@ -2009,6 +2159,70 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
                 },
                 fields: 'userEnteredFormat'
             }
+        },
+        // Add conditional formatting for Status column
+        {
+            addConditionalFormatRule: {
+                rule: {
+                    ranges: [{
+                        sheetId: sheetId,
+                        startRowIndex: 1,
+                        endRowIndex: testScenarios.length + 1,
+                        startColumnIndex: 3,
+                        endColumnIndex: 4
+                    }],
+                    booleanRule: {
+                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Pass' }] },
+                        format: {
+                            backgroundColor: { red: 0.0, green: 0.5, blue: 0.0 },
+                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
+                        }
+                    }
+                },
+                index: 0
+            }
+        },
+        {
+            addConditionalFormatRule: {
+                rule: {
+                    ranges: [{
+                        sheetId: sheetId,
+                        startRowIndex: 1,
+                        endRowIndex: testScenarios.length + 1,
+                        startColumnIndex: 3,
+                        endColumnIndex: 4
+                    }],
+                    booleanRule: {
+                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Fail' }] },
+                        format: {
+                            backgroundColor: { red: 0.6, green: 0.0, blue: 0.0 },
+                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
+                        }
+                    }
+                },
+                index: 1
+            }
+        },
+        {
+            addConditionalFormatRule: {
+                rule: {
+                    ranges: [{
+                        sheetId: sheetId,
+                        startRowIndex: 1,
+                        endRowIndex: testScenarios.length + 1,
+                        startColumnIndex: 3,
+                        endColumnIndex: 4
+                    }],
+                    booleanRule: {
+                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Blocked' }] },
+                        format: {
+                            backgroundColor: { red: 1.0, green: 1.0, blue: 0.0 },
+                            textFormat: { foregroundColor: { red: 0.0, green: 0.0, blue: 0.0 } }
+                        }
+                    }
+                },
+                index: 2
+            }
         }
     ];
 
@@ -2016,5 +2230,38 @@ async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testS
     await sheets.spreadsheets.batchUpdate({
         spreadsheetId,
         requestBody: { requests: testScenariosFormatRequests }
+    });
+
+    // Add data validation for Status column
+    await sheets.spreadsheets.batchUpdate({
+        spreadsheetId,
+        requestBody: {
+            requests: [
+                {
+                    setDataValidation: {
+                        range: {
+                            sheetId: sheetId,
+                            startRowIndex: 1,
+                            endRowIndex: testScenarios.length + 1,
+                            startColumnIndex: 3,
+                            endColumnIndex: 4
+                        },
+                        rule: {
+                            condition: {
+                                type: 'ONE_OF_LIST',
+                                values: [
+                                    { userEnteredValue: 'Not Tested' },
+                                    { userEnteredValue: 'Pass' },
+                                    { userEnteredValue: 'Fail' },
+                                    { userEnteredValue: 'Blocked' }
+                                ]
+                            },
+                            showCustomUi: true,
+                            strict: true
+                        }
+                    }
+                }
+            ]
+        }
     });
 }
