@@ -1,23 +1,28 @@
 import express from 'express';
-import {  getAuthUrl, 
-    handleCallback, 
-    getConnectionStatus, 
+import {     
     generateTestCasesWithOptions,
     getTestCases,
     analyzeTestCases,
     modifyTestCases,
-    getAvailableSheets,
     processCustomPrompt} from '../controller/sheetsController.js';
 import { ProtectRoute } from '../middlewares/authMiddleware.js';
+import {
+    getAuthUrl,
+    handleCallback,
+    getConnectionStatus,
+    getAvailableSheets,
+    removeCredentials
+} from '../controller/oauthController.js';
 
 const router = express.Router();
 
 router.get('/auth-url', ProtectRoute, getAuthUrl);
 router.get('/callback', handleCallback);
 router.get('/status', ProtectRoute, getConnectionStatus);
-router.post('/generate', ProtectRoute, generateTestCasesWithOptions);
+router.delete('/disconnect', ProtectRoute, removeCredentials);
 
-router.get('/sheets', ProtectRoute, getAvailableSheets);
+router.post('/generate', ProtectRoute, generateTestCasesWithOptions);
+router.get('/list', ProtectRoute, getAvailableSheets);
 router.get('/test-cases', ProtectRoute, getTestCases);
 router.post('/analyze', ProtectRoute, analyzeTestCases);
 router.post('/modify', ProtectRoute, modifyTestCases);

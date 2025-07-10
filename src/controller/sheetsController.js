@@ -1,151 +1,28 @@
 import { google } from 'googleapis';
 import { GoogleGenerativeAI } from '@google/generative-ai';
-import UserToken from '../models/UserToken.js';
-import dotenv from "dotenv"
+import { getAuthenticatedSheetsClient } from './oauthController.js';
+import {
+    analyzePromptIntent,
+    applyIntelligentArrangement,
+    updateSpreadsheetWithArrangement,
+    createCompactTestCasesContext,
+    createCompactTestScenariosContext,
+    parseGeminiJSON,
+    parseTestScenariosJSON,
+    validateAndCleanTestCases,
+    callGeminiWithRetry,
+    appendTestCasesToExistingSheet,
+    appendTestScenariosToExistingSheet,
+    addTestCasesSheetData,
+    addTestScenariosSheetData,
+    // ADD THESE NEW IMPORTS:
+    updateGenerateTestCasesPrompt,
+    parseGeminiJSONEnhanced
+} from '../lib/sheetsHelpers.js';
+import dotenv from "dotenv";
 dotenv.config();
 
-const oauth2Client = new google.auth.OAuth2(
-    process.env.GOOGLE_CLIENT_ID,
-    process.env.GOOGLE_CLIENT_SECRET,
-    process.env.GOOGLE_REDIRECT_URI
-);
-
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-
-// Workflow patterns and domain knowledge
-const WORKFLOW_PATTERNS = {
-    login: {
-        sequence: ['setup', 'authentication', 'authorization', 'session_management', 'logout', 'cleanup'],
-        dependencies: ['setup_before_auth', 'auth_before_session', 'session_before_main_features']
-    },
-    ecommerce: {
-        sequence: ['browse', 'search', 'product_view', 'cart', 'checkout', 'payment', 'confirmation', 'order_tracking'],
-        criticalPath: ['payment', 'checkout', 'inventory']
-    },
-    api: {
-        sequence: ['authentication', 'crud_operations', 'error_handling', 'performance', 'security'],
-        dependencies: ['auth_required_before_data_operations']
-    },
-    user_management: {
-        sequence: ['registration', 'profile_setup', 'permissions', 'user_operations', 'deactivation'],
-        criticalPath: ['registration', 'authentication', 'permissions']
-    }
-};
-
-const TESTING_BEST_PRACTICES = {
-    execution_order: ['setup', 'positive_cases', 'negative_cases', 'edge_cases', 'cleanup'],
-    priority_mapping: { 'High': 1, 'Medium': 2, 'Low': 3 },
-    type_order: ['Functional', 'Integration', 'Edge Case', 'Security', 'Performance']
-};
-
-export const getAuthUrl = async (req, res) => {
-    try {
-        const scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive.readonly'
-        ];
-
-        const authUrl = oauth2Client.generateAuthUrl({
-            access_type: 'offline',
-            scope: scopes,
-            state: req.user._id.toString(),
-            prompt: 'consent'
-        });
-
-        res.json({ authUrl });
-    } catch (error) {
-        console.error('Error generating auth URL:', error);
-        res.status(500).json({ message: 'Failed to generate authorization URL' });
-    }
-};
-
-export const handleCallback = async (req, res) => {
-    try {
-        const { code, state } = req.query;
-        const userId = state;
-
-        console.log("🔄 OAuth Callback for user:", userId);
-
-        const { tokens } = await oauth2Client.getToken(code);
-
-        console.log("✅ Received tokens:", {
-            hasAccessToken: !!tokens.access_token,
-            hasRefreshToken: !!tokens.refresh_token,
-            expiryDate: tokens.expiry_date
-        });
-
-        await UserToken.findOneAndUpdate(
-            { userId: userId },
-            {
-                userId: userId,
-                accessToken: tokens.access_token,
-                refreshToken: tokens.refresh_token,
-                expiryDate: new Date(tokens.expiry_date),
-                scope: tokens.scope?.split(' ') || []
-            },
-            { upsert: true, new: true }
-        );
-
-        console.log("💾 Tokens saved to database for user:", userId);
-
-        res.send(`
-            <html>
-                <body>
-                    <script>
-                        window.close();
-                    </script>
-                    <p>Authorization successful! You can close this window.</p>
-                </body>
-            </html>
-        `);
-    } catch (error) {
-        console.error('Error handling OAuth callback:', error);
-        res.status(500).send('Authorization failed');
-    }
-};
-
-export const getConnectionStatus = async (req, res) => {
-    try {
-        const userId = req.user._id.toString();
-        const userToken = await UserToken.findOne({ userId: userId });
-
-        if (!userToken) {
-            console.log("❌ No tokens found in database for user:", userId);
-            return res.json({ connected: false });
-        }
-
-        console.log("✅ Tokens found in database for user:", userId);
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const drive = google.drive({ version: 'v3', auth: oauth2Client });
-
-        const response = await drive.files.list({
-            q: "mimeType='application/vnd.google-apps.spreadsheet'",
-            pageSize: 10,
-            fields: 'files(id, name)'
-        });
-
-        res.json({
-            connected: true,
-            spreadsheets: response.data.files
-        });
-    } catch (error) {
-        console.error('Error checking connection status:', error);
-
-        if (error.message.includes('invalid_grant') || error.message.includes('Token has been expired')) {
-            console.log("🔄 Token expired, user needs to re-authenticate");
-            await UserToken.findOneAndDelete({ userId: req.user._id.toString() });
-        }
-
-        res.json({ connected: false });
-    }
-};
 
 export const getTestCases = async (req, res) => {
     try {
@@ -154,20 +31,7 @@ export const getTestCases = async (req, res) => {
 
         console.log("📊 Getting test cases for user:", userId);
 
-        const userToken = await UserToken.findOne({ userId: userId });
-
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
         // FIXED: Use A:J range for 10 columns
         const response = await sheets.spreadsheets.values.get({
@@ -217,21 +81,8 @@ export const analyzeTestCases = async (req, res) => {
 
         console.log("🔍 Analyzing test cases for user:", userId);
 
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-
-        // FIXED: Use A:J range for 10 columns
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId,
             range: `'${sheetName}'!A:J`,
@@ -242,7 +93,6 @@ export const analyzeTestCases = async (req, res) => {
             return res.json({ analysis: 'No test cases found to analyze' });
         }
 
-        // FIXED: Map to new column structure
         const testCases = rows.slice(1).map((row, index) => ({
             id: row[0] || '',
             module: row[1] || '',
@@ -257,77 +107,105 @@ export const analyzeTestCases = async (req, res) => {
         })).filter(tc => tc.id);
 
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
         let analysisPrompt = '';
 
+        // FIXED: Move the switch statement INSIDE the function
         switch (analysisType) {
             case 'coverage':
-                analysisPrompt = `
-                Analyze the test coverage of these test cases:
+                // Instead of sending full JSON, send summary statistics
+                const moduleStats = {};
+                const typeStats = {};
+                testCases.forEach(tc => {
+                    moduleStats[tc.module] = (moduleStats[tc.module] || 0) + 1;
+                    typeStats[tc.testCaseType] = (typeStats[tc.testCaseType] || 0) + 1;
+                });
 
-                ${JSON.stringify(testCases, null, 2)}
+                analysisPrompt = `
+                Analyze test coverage for ${testCases.length} test cases:
+
+                Module distribution: ${Object.entries(moduleStats).map(([k, v]) => `${k}: ${v}`).join(', ')}
+                Type distribution: ${Object.entries(typeStats).map(([k, v]) => `${k}: ${v}`).join(', ')}
+                
+                Sample test cases (first 5):
+                ${testCases.slice(0, 5).map(tc => `- ${tc.id}: ${tc.summary} (${tc.testCaseType})`).join('\n')}
 
                 Provide analysis on:
-                1. Functional coverage gaps
-                2. Test case type distribution (Positive vs Negative)
-                3. Module and submodule coverage
-                4. Missing edge cases
-                5. Recommendations for improvement
-
-                Return the analysis in a structured format.
+                1. Coverage gaps in modules/submodules
+                2. Test type balance recommendations
+                3. Missing edge cases
+                4. Improvement suggestions
                 `;
                 break;
 
             case 'quality':
+                // Send only essential quality indicators
+                const qualityStats = testCases.slice(0, 10).map(tc => ({
+                    id: tc.id,
+                    summary: tc.summary,
+                    stepsLength: tc.testSteps.length,
+                    expectedLength: tc.expectedResults.length,
+                    hasDetailedSteps: tc.testSteps.includes('Step 1') || tc.testSteps.includes('1.')
+                }));
+
                 analysisPrompt = `
-                Analyze the quality of these test cases:
+                Analyze quality of ${testCases.length} test cases.
 
-                ${JSON.stringify(testCases, null, 2)}
+                Sample quality indicators:
+                ${qualityStats.map(q => `- ${q.id}: Summary length: ${q.summary.length}, Steps: ${q.stepsLength} chars, Expected: ${q.expectedLength} chars, Structured: ${q.hasDetailedSteps}`).join('\n')}
 
-                Evaluate:
-                1. Clarity and completeness of test steps
-                2. Adequacy of expected results
-                3. Test case independence
-                4. Proper module/submodule organization
-                5. Potential for automation
-                6. Quality score for each test case
-
-                Provide detailed feedback and suggestions.
+                Evaluate and provide:
+                1. Test case clarity assessment
+                2. Completeness scoring
+                3. Independence verification
+                4. Organization recommendations
+                5. Automation potential
                 `;
                 break;
 
             case 'duplicates':
-                analysisPrompt = `
-                Find duplicate or similar test cases:
+                // Send only summaries and key identifiers for duplicate detection
+                const summariesOnly = testCases.map(tc => ({
+                    id: tc.id,
+                    summary: tc.summary.toLowerCase().trim(),
+                    submodule: tc.submodule,
+                    keyWords: tc.testSteps.toLowerCase().split(' ').filter(w => w.length > 4).slice(0, 5).join(' ')
+                }));
 
-                ${JSON.stringify(testCases, null, 2)}
+                analysisPrompt = `
+                Find duplicates in ${testCases.length} test cases:
+
+                Test case identifiers:
+                ${summariesOnly.map(s => `- ${s.id}: "${s.summary}" | ${s.submodule} | Keywords: ${s.keyWords}`).join('\n')}
 
                 Identify:
-                1. Exact duplicates
-                2. Similar test cases that could be merged
-                3. Overlapping test scenarios
-                4. Recommendations for consolidation
-
-                List specific test case IDs that are duplicates or similar.
+                1. Exact duplicate summaries
+                2. Similar test cases (>80% similarity)
+                3. Overlapping scenarios
+                4. Consolidation recommendations
                 `;
                 break;
 
             default:
+                // General analysis with minimal data
+                const generalStats = {
+                    total: testCases.length,
+                    modules: [...new Set(testCases.map(tc => tc.module))].length,
+                    submodules: [...new Set(testCases.map(tc => tc.submodule))].length,
+                    positive: testCases.filter(tc => tc.testCaseType === 'Positive').length,
+                    negative: testCases.filter(tc => tc.testCaseType === 'Negative').length
+                };
+
                 analysisPrompt = `
-                Provide a comprehensive analysis of these test cases:
+                Analyze test suite with ${generalStats.total} test cases:
+                
+                Statistics:
+                - ${generalStats.modules} modules, ${generalStats.submodules} submodules
+                - ${generalStats.positive} positive, ${generalStats.negative} negative cases
+                
+                Sample cases:
+                ${testCases.slice(0, 8).map(tc => `- ${tc.id}: ${tc.summary} (${tc.testCaseType})`).join('\n')}
 
-                ${JSON.stringify(testCases, null, 2)}
-
-                Include:
-                1. Overall test suite summary
-                2. Strengths and weaknesses
-                3. Coverage analysis by module and submodule
-                4. Quality assessment
-                5. Test case type distribution
-                6. Specific recommendations
-                7. Test metrics and statistics
-
-                Make the analysis actionable and detailed.
+                Provide comprehensive analysis with actionable recommendations.
                 `;
         }
 
@@ -360,23 +238,11 @@ export const modifyTestCases = async (req, res) => {
 
         console.log("✏️ Modifying test cases for user:", userId);
 
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
         const response = await sheets.spreadsheets.values.get({
             spreadsheetId,
-            range: `'${sheetName}'!A:I`,
+            range: `'${sheetName}'!A:J`, // FIXED: Changed from A:I to A:J
         });
 
         const rows = response.data.values;
@@ -384,59 +250,37 @@ export const modifyTestCases = async (req, res) => {
             return res.json({ message: 'No test cases found to modify' });
         }
 
+        // FIXED: Map to correct column structure
         const testCases = rows.slice(1).map((row, index) => ({
             rowIndex: index + 2,
             id: row[0] || '',
-            title: row[1] || '',
-            description: row[2] || '',
-            preconditions: row[3] || '',
-            steps: row[4] || '',
-            expectedResult: row[5] || '',
-            priority: row[6] || 'Medium',
-            type: row[7] || 'Functional',
-            status: row[8] || 'Not Executed'
+            module: row[1] || '',
+            submodule: row[2] || '',
+            summary: row[3] || '',
+            testSteps: row[4] || '',
+            expectedResults: row[5] || '',
+            actualResult: row[6] || '',
+            testCaseType: row[7] || 'Positive',
+            environment: row[8] || 'Test',
+            status: row[9] || 'Not Tested'
         })).filter(tc => tc.id);
 
         const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
+        // FIXED: Use optimized prompt
         const modificationPromptForAI = `
-        You are helping to modify test cases based on user instructions. 
+Modify test cases based on user request.
 
-        Current test cases:
-        ${JSON.stringify(testCases, null, 2)}
+Test Cases Summary (${testCases.length} total):
+${testCases.map(tc => `- ${tc.id}: ${tc.summary} (${tc.testCaseType})`).join('\n')}
 
-        User modification request: "${modificationPrompt}"
+User Request: "${modificationPrompt}"
 
-        Analyze the user's request and return a JSON response with the following structure:
-        {
-            "modifications": [
-                {
-                    "testCaseId": "TC001",
-                    "action": "update|delete|add",
-                    "changes": {
-                        "title": "new title if changed",
-                        "description": "new description if changed",
-                        "steps": "new steps if changed",
-                        "expectedResult": "new expected result if changed",
-                        "priority": "new priority if changed",
-                        "type": "new type if changed",
-                        "preconditions": "new preconditions if changed"
-                    },
-                    "reason": "explanation of why this change was made"
-                }
-            ],
-            "summary": "Summary of all modifications made"
-        }
+Return JSON with modifications array containing testCaseId, action, changes, and reason.
+Rules: Only include changed fields, be precise with IDs, explain reasons clearly.
 
-        Rules:
-        - Only include fields that are being changed in the "changes" object
-        - For "delete" action, changes object can be empty
-        - For "add" action, include all required fields for the new test case
-        - Be precise about which test cases to modify based on the user's request
-        - If the request is unclear, suggest reasonable interpretations
-
-        Return ONLY the JSON response, no additional text or formatting.
-        `;
+Return ONLY JSON, no formatting.
+`;
 
         console.log("🤖 Processing modification request with AI...");
         const result = await model.generateContent(modificationPromptForAI);
@@ -455,40 +299,43 @@ export const modifyTestCases = async (req, res) => {
             const testCase = testCases.find(tc => tc.id === mod.testCaseId);
 
             if (mod.action === 'update' && testCase) {
+                // FIXED: Update to use correct field names
                 const updatedRow = [
                     testCase.id,
-                    mod.changes.title || testCase.title,
-                    mod.changes.description || testCase.description,
-                    mod.changes.preconditions || testCase.preconditions,
-                    mod.changes.steps || testCase.steps,
-                    mod.changes.expectedResult || testCase.expectedResult,
-                    mod.changes.priority || testCase.priority,
-                    mod.changes.type || testCase.type,
-                    testCase.status
+                    mod.changes.module || testCase.module,
+                    mod.changes.submodule || testCase.submodule,
+                    mod.changes.summary || testCase.summary,
+                    mod.changes.testSteps || testCase.testSteps,
+                    mod.changes.expectedResults || testCase.expectedResults,
+                    mod.changes.actualResult || testCase.actualResult,
+                    mod.changes.testCaseType || testCase.testCaseType,
+                    mod.changes.environment || testCase.environment,
+                    mod.changes.status || testCase.status
                 ];
 
                 updates.push({
-                    range: `'${sheetName}'!A${testCase.rowIndex}:I${testCase.rowIndex}`,
+                    range: `'${sheetName}'!A${testCase.rowIndex}:J${testCase.rowIndex}`, // FIXED: Changed to J
                     values: [updatedRow]
                 });
 
             } else if (mod.action === 'delete' && testCase) {
                 updates.push({
-                    range: `'${sheetName}'!A${testCase.rowIndex}:I${testCase.rowIndex}`,
-                    values: [['', '', '', '', '', '', '', '', '']]
+                    range: `'${sheetName}'!A${testCase.rowIndex}:J${testCase.rowIndex}`, // FIXED: Changed to J
+                    values: [['', '', '', '', '', '', '', '', '', '']] // FIXED: Added more empty strings
                 });
 
             } else if (mod.action === 'add') {
                 const newRow = [
                     mod.testCaseId,
-                    mod.changes.title || '',
-                    mod.changes.description || '',
-                    mod.changes.preconditions || '',
-                    mod.changes.steps || '',
-                    mod.changes.expectedResult || '',
-                    mod.changes.priority || 'Medium',
-                    mod.changes.type || 'Functional',
-                    'Not Executed'
+                    mod.changes.module || '',
+                    mod.changes.submodule || '',
+                    mod.changes.summary || '',
+                    mod.changes.testSteps || '',
+                    mod.changes.expectedResults || '',
+                    mod.changes.actualResult || '',
+                    mod.changes.testCaseType || 'Positive',
+                    mod.changes.environment || 'Test',
+                    mod.changes.status || 'Not Tested'
                 ];
                 addedTestCases.push(newRow);
             }
@@ -545,19 +392,7 @@ export const processCustomPrompt = async (req, res) => {
         console.log("🧠 Processing custom prompt for user:", userId);
         console.log("📝 Custom prompt:", customPrompt);
 
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
         // FIXED: Get current test cases with A:J range
         const response = await sheets.spreadsheets.values.get({
@@ -627,343 +462,378 @@ export const processCustomPrompt = async (req, res) => {
     }
 };
 
-// Analyze the intent behind the custom prompt
-async function analyzePromptIntent(prompt, testCases) {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    const intentPrompt = `
-    Analyze this user prompt for test case arrangement and determine the intent:
-    
-    User Prompt: "${prompt}"
-    
-    Current Test Cases Summary:
-    - Total: ${testCases.length}
-    - Priorities: ${getDistribution(testCases, 'priority')}
-    - Types: ${getDistribution(testCases, 'type')}
-    - Test Case IDs: ${testCases.map(tc => tc.id).join(', ')}
-    
-    Available Workflow Patterns: ${Object.keys(WORKFLOW_PATTERNS).join(', ')}
-    Testing Best Practices: ${JSON.stringify(TESTING_BEST_PRACTICES)}
-    
-    Return a JSON response with this structure:
-    {
-        "intent": "workflow|priority|dependency|risk|module|execution|custom",
-        "strategy": "specific arrangement strategy to apply",
-        "confidence": 0.95,
-        "detectedPattern": "login|ecommerce|api|user_management|custom",
-        "arrangementCriteria": {
-            "primarySort": "field to sort by first",
-            "secondarySort": "field to sort by second", 
-            "groupBy": "field to group by if applicable",
-            "direction": "ascending|descending"
-        },
-        "summary": "Clear explanation of what will be done",
-        "changes": "Description of expected changes"
-    }
-    
-    Consider these intent categories:
-    - "workflow": Arrange in logical business/user flow order
-    - "priority": Sort by test priority or business importance  
-    - "dependency": Order by technical dependencies
-    - "risk": Arrange by risk level or business impact
-    - "module": Group by functionality/module
-    - "execution": Optimize for test execution efficiency
-    - "custom": Other specific arrangements
-    
-    Return ONLY valid JSON.
-    `;
-
+export const generateTestCasesWithOptions = async (req, res) => {
     try {
-        const result = await model.generateContent(intentPrompt);
-        const response = await result.response;
-        const intentText = response.text();
-
-        // Clean and parse the response
-        const cleanedText = intentText.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-        return JSON.parse(cleanedText);
-    } catch (error) {
-        console.error('Error analyzing intent:', error);
-        // Return default intent analysis
-        return {
-            intent: 'workflow',
-            strategy: 'basic_workflow_arrangement',
-            confidence: 0.7,
-            detectedPattern: 'custom',
-            arrangementCriteria: {
-                primarySort: 'priority',
-                secondarySort: 'type',
-                groupBy: null,
-                direction: 'ascending'
-            },
-            summary: 'Arranging test cases in a logical workflow order',
-            changes: 'Test cases will be reordered based on testing best practices'
-        };
-    }
-}
-
-// Apply intelligent arrangement based on intent
-async function applyIntelligentArrangement(testCases, prompt, intentAnalysis) {
-    const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-    const arrangementPrompt = `
-    You are an expert test case arrangement system. Arrange these test cases according to the user's request.
-    
-    User Prompt: "${prompt}"
-    Intent Analysis: ${JSON.stringify(intentAnalysis)}
-    
-    Current Test Cases:
-    ${JSON.stringify(testCases, null, 2)}
-    
-    Workflow Patterns Available:
-    ${JSON.stringify(WORKFLOW_PATTERNS, null, 2)}
-    
-    Testing Best Practices:
-    ${JSON.stringify(TESTING_BEST_PRACTICES, null, 2)}
-    
-    Instructions:
-    1. Analyze the test cases and understand their relationships
-    2. Apply the detected intent and strategy: ${intentAnalysis.strategy}
-    3. Consider dependencies, business logic flow, and testing best practices
-    4. Maintain test case integrity (don't modify content, only order)
-    5. Return the complete reordered array
-    
-    Return a JSON response with this structure:
-    {
-        "arrangedTestCases": [
-            // Complete array of test cases in new order
-            // Keep all original fields: rowIndex, id, title, description, etc.
-        ],
-        "arrangementLogic": "Explanation of the arrangement logic applied",
-        "groupings": [
-            {
-                "name": "Setup & Prerequisites", 
-                "testCases": ["TC001", "TC002"],
-                "reason": "Why this grouping"
-            }
-        ],
-        "dependencies": [
-            {
-                "before": "TC001",
-                "after": "TC005", 
-                "reason": "TC001 must run before TC005 because..."
-            }
-        ]
-    }
-    
-    Key Principles:
-    - Respect logical flow (setup → positive → negative → edge cases → cleanup)
-    - Group related functionality together
-    - Consider technical dependencies
-    - Prioritize by business impact when requested
-    - Maintain testing efficiency
-    
-    Return ONLY valid JSON with the complete reordered test case array.
-    `;
-
-    try {
-        const result = await model.generateContent(arrangementPrompt);
-        const response = await result.response;
-        const arrangementText = response.text();
-        const cleanedText = arrangementText.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-        const arrangementResult = JSON.parse(cleanedText);
-
-        // Validate that we have all original test cases
-        if (arrangementResult.arrangedTestCases.length !== testCases.length) {
-            console.warn('⚠️ Arrangement result has different count, falling back to priority sort');
-            return sortByPriority(testCases);
-        }
-
-        return arrangementResult.arrangedTestCases;
-
-    } catch (error) {
-        console.error('Error in arrangement:', error);
-        // Fallback to simple priority-based sorting
-        return sortByPriority(testCases);
-    }
-}
-
-// Update spreadsheet with new arrangement
-async function updateSpreadsheetWithArrangement(sheets, spreadsheetId, sheetName, arrangedTestCases, headerRow) {
-    try {
-        // Prepare data for update
-        const updatedData = [headerRow]; // Keep original header
-
-        arrangedTestCases.forEach(testCase => {
-            updatedData.push([
-                testCase.id,
-                testCase.module,
-                testCase.submodule,
-                testCase.summary,
-                testCase.testSteps,
-                testCase.expectedResults,
-                testCase.actualResult || '',
-                testCase.testCaseType,
-                testCase.environment,
-                testCase.status
-            ]);
-        });
-
-        // FIXED: Clear the existing data for 10 columns
-        await sheets.spreadsheets.values.clear({
+        const {
+            module,
+            summary,
+            acceptanceCriteria,
             spreadsheetId,
-            range: `'${sheetName}'!A:J`
-        });
+            generateTestCases = true,
+            generateTestScenarios = true,
+            testCasesCount = 20,
+            testScenariosCount = 10,
+            testCasesSheetName = null,
+            testScenariosSheetName = null
+        } = req.body;
 
-        // Write the rearranged data
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: `'${sheetName}'!A1`,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: {
-                values: updatedData
-            }
-        });
-
-        console.log("✅ Spreadsheet updated with new arrangement");
-        return true;
-    } catch (error) {
-        console.error('Error updating spreadsheet:', error);
-        return false;
-    }
-}
-
-// Helper functions
-function getDistribution(testCases, field) {
-    const distribution = {};
-    testCases.forEach(tc => {
-        distribution[tc[field]] = (distribution[tc[field]] || 0) + 1;
-    });
-    return Object.entries(distribution).map(([key, value]) => `${key}:${value}`).join(', ');
-}
-
-function sortByPriority(testCases) {
-    return testCases.sort((a, b) => {
-        const priorityOrder = { 'High': 1, 'Medium': 2, 'Low': 3 };
-        return priorityOrder[a.priority] - priorityOrder[b.priority];
-    });
-}
-
-export const getAvailableSheets = async (req, res) => {
-    try {
-        const { spreadsheetId } = req.query;
         const userId = req.user._id.toString();
+        console.log("🔧 Generate with options for user:", userId);
+        console.log(`📊 Requested: ${testCasesCount} test cases, ${testScenariosCount} scenarios`);
 
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
+        // Validate input
+        if (!module || !summary || !acceptanceCriteria) {
+            return res.status(400).json({
+                success: false,
+                message: 'Missing required fields: module, summary, or acceptanceCriteria'
+            });
         }
 
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
+        // Check if at least one generation option is selected
+        if (!generateTestCases && !generateTestScenarios) {
+            return res.status(400).json({
+                success: false,
+                message: 'At least one generation option (testCases or testScenarios) must be selected'
+            });
+        }
 
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
-        const response = await sheets.spreadsheets.get({
-            spreadsheetId,
-            fields: 'sheets.properties'
-        });
+        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+        const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
 
-        const availableSheets = response.data.sheets.map(sheet => ({
-            name: sheet.properties.title,
-            id: sheet.properties.sheetId,
-            index: sheet.properties.index
-        }));
+        let testCases = [];
+        let testScenarios = [];
+        let createdSheets = [];
+
+        // OPTIMIZED: Use compact context generation
+        let existingTestCasesContext = "";
+        let existingTestScenariosContext = "";
+
+        // OPTIMIZED: Get existing test cases context (lightweight)
+        if (generateTestCases && testCasesSheetName && testCasesSheetName.trim()) {
+            try {
+                const existingResponse = await sheets.spreadsheets.values.get({
+                    spreadsheetId,
+                    range: `'${testCasesSheetName.trim()}'!A:J`,
+                });
+
+                const existingRows = existingResponse.data.values || [];
+                if (existingRows.length > 1) {
+                    // OPTIMIZED: Extract only essential fields
+                    const existingTestCases = existingRows.slice(1).map((row, index) => ({
+                        id: row[0] || '',
+                        module: row[1] || '',
+                        submodule: row[2] || '',
+                        summary: row[3] || '',
+                        testSteps: row[4] || '', // ADD testSteps for enhanced validation
+                        testCaseType: row[7] || 'Positive'
+                    })).filter(tc => tc.id);
+
+                    if (existingTestCases.length > 0) {
+                        existingTestCasesContext = createCompactTestCasesContext(existingTestCases, testCasesSheetName);
+                    }
+                }
+            } catch (error) {
+                console.log("⚠️ Could not fetch existing test cases context:", error.message);
+            }
+        }
+
+        // OPTIMIZED: Get existing test scenarios context (lightweight)
+        if (generateTestScenarios && testScenariosSheetName && testScenariosSheetName.trim()) {
+            try {
+                const existingResponse = await sheets.spreadsheets.values.get({
+                    spreadsheetId,
+                    range: `'${testScenariosSheetName.trim()}'!A:D`,
+                });
+
+                const existingRows = existingResponse.data.values || [];
+                if (existingRows.length > 1) {
+                    // OPTIMIZED: Extract only essential fields
+                    const existingTestScenarios = existingRows.slice(1).map((row, index) => ({
+                        condition: row[1] || '',
+                        testScenarios: row[2] || ''
+                    })).filter(ts => ts.testScenarios);
+
+                    if (existingTestScenarios.length > 0) {
+                        existingTestScenariosContext = createCompactTestScenariosContext(existingTestScenarios, testScenariosSheetName);
+                    }
+                }
+            } catch (error) {
+                console.log("⚠️ Could not fetch existing test scenarios context:", error.message);
+            }
+        }
+
+        // ENHANCED: Generate Test Cases with enhanced duplicate prevention
+        if (generateTestCases) {
+            let nextIdNumber = 1;
+            let existingTestCasesForValidation = [];
+
+            if (existingTestCasesContext) {
+                const lastIdMatch = existingTestCasesContext.match(/Last ID: PC_(\d+)/);
+                if (lastIdMatch) {
+                    nextIdNumber = parseInt(lastIdMatch[1]) + 1;
+                }
+
+                // Get existing test cases for validation
+                try {
+                    const existingResponse = await sheets.spreadsheets.values.get({
+                        spreadsheetId,
+                        range: `'${testCasesSheetName.trim()}'!A:J`,
+                    });
+
+                    const existingRows = existingResponse.data.values || [];
+                    if (existingRows.length > 1) {
+                        existingTestCasesForValidation = existingRows.slice(1).map((row, index) => ({
+                            id: row[0] || '',
+                            module: row[1] || '',
+                            submodule: row[2] || '',
+                            summary: row[3] || '',
+                            testSteps: row[4] || '',
+                            expectedResults: row[5] || '',
+                            testCaseType: row[7] || 'Positive'
+                        })).filter(tc => tc.id);
+                    }
+                } catch (error) {
+                    console.log("⚠️ Could not fetch existing test cases for validation:", error.message);
+                }
+            }
+
+            // ENHANCED: Use the improved prompt
+            const testCasesPrompt = updateGenerateTestCasesPrompt(
+                module,
+                summary,
+                acceptanceCriteria,
+                testCasesCount,
+                existingTestCasesContext,
+                nextIdNumber
+            );
+
+            try {
+                console.log("🤖 Generating test cases with enhanced duplicate prevention...");
+                const testCasesText = await callGeminiWithRetry(model, testCasesPrompt, 3, 2000);
+
+                // ENHANCED: Use enhanced parsing and validation
+                testCases = parseGeminiJSONEnhanced(testCasesText, existingTestCasesForValidation);
+
+                console.log(`📊 Final unique test cases after enhanced validation: ${testCases.length}`);
+
+                if (testCases.length > 0) {
+                    let finalTestCasesSheetName;
+
+                    if (testCasesSheetName && testCasesSheetName.trim()) {
+                        finalTestCasesSheetName = testCasesSheetName.trim();
+                        console.log("📝 Appending test cases to existing sheet:", finalTestCasesSheetName);
+                        await appendTestCasesToExistingSheet(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
+                    } else {
+                        finalTestCasesSheetName = `Test Cases - ${module} - ${timestamp}`;
+                        console.log("📝 Creating new test cases sheet:", finalTestCasesSheetName);
+
+                        await sheets.spreadsheets.batchUpdate({
+                            spreadsheetId,
+                            requestBody: {
+                                requests: [{
+                                    addSheet: {
+                                        properties: {
+                                            title: finalTestCasesSheetName,
+                                            gridProperties: {
+                                                rowCount: 100,
+                                                columnCount: 10
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        });
+
+                        await addTestCasesSheetData(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
+                    }
+
+                    createdSheets.push({
+                        type: 'testCases',
+                        name: finalTestCasesSheetName,
+                        count: testCases.length,
+                        action: testCasesSheetName ? 'appended' : 'created'
+                    });
+                }
+            } catch (error) {
+                console.error('❌ Error generating test cases:', error);
+
+                // Handle specific API errors
+                if (error.message.includes('503') || error.message.includes('overloaded')) {
+                    return res.status(503).json({
+                        success: false,
+                        message: 'AI service is currently overloaded. Please try again in a few minutes.',
+                        errorType: 'SERVICE_OVERLOADED',
+                        retryAfter: 60000
+                    });
+                }
+
+                if (error.message.includes('429') || error.message.includes('rate limit')) {
+                    return res.status(429).json({
+                        success: false,
+                        message: 'Rate limit exceeded. Please wait before making another request.',
+                        errorType: 'RATE_LIMITED',
+                        retryAfter: 30000
+                    });
+                }
+
+                throw error;
+            }
+        }
+
+        // OPTIMIZED: Generate Test Scenarios with lightweight prompt  
+        if (generateTestScenarios) {
+            // OPTIMIZED: Much shorter prompt
+            const testScenariosPrompt = `
+Generate ${testScenariosCount} test scenarios for: ${module}
+
+Summary: ${summary}
+Acceptance Criteria: ${acceptanceCriteria}
+${existingTestScenariosContext ? `\nExisting Context:\n${existingTestScenariosContext}` : ''}
+
+Requirements:
+- Create different conditions/workflows than existing
+- Cover various user states and system conditions
+- Include valid/invalid inputs, error scenarios
+
+JSON Format:
+[
+  {
+    "id": "TS_1",
+    "module": "${module}",
+    "condition": "Specific condition/state",
+    "testScenarios": "Complete workflow description",
+    "status": "Not Tested"
+  }
+]
+
+Return ONLY JSON array with ${testScenariosCount} scenarios.
+`;
+
+            try {
+                console.log("🤖 Generating test scenarios...");
+                const testScenariosText = await callGeminiWithRetry(model, testScenariosPrompt, 3, 2000);
+                testScenarios = parseTestScenariosJSON(testScenariosText);
+
+                if (testScenarios.length > 0) {
+                    let finalTestScenariosSheetName;
+
+                    if (testScenariosSheetName && testScenariosSheetName.trim()) {
+                        finalTestScenariosSheetName = testScenariosSheetName.trim();
+                        console.log("📝 Appending test scenarios to existing sheet:", finalTestScenariosSheetName);
+                        await appendTestScenariosToExistingSheet(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
+                    } else {
+                        finalTestScenariosSheetName = `Test Scenarios - ${module} - ${timestamp}`;
+                        console.log("📝 Creating new test scenarios sheet:", finalTestScenariosSheetName);
+
+                        await sheets.spreadsheets.batchUpdate({
+                            spreadsheetId,
+                            requestBody: {
+                                requests: [{
+                                    addSheet: {
+                                        properties: {
+                                            title: finalTestScenariosSheetName,
+                                            gridProperties: {
+                                                rowCount: 50,
+                                                columnCount: 4
+                                            }
+                                        }
+                                    }
+                                }]
+                            }
+                        });
+
+                        await addTestScenariosSheetData(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
+                    }
+
+                    createdSheets.push({
+                        type: 'testScenarios',
+                        name: finalTestScenariosSheetName,
+                        count: testScenarios.length,
+                        action: testScenariosSheetName ? 'appended' : 'created'
+                    });
+                }
+            } catch (error) {
+                console.error('❌ Error generating test scenarios:', error);
+
+                // Handle specific API errors
+                if (error.message.includes('503') || error.message.includes('overloaded')) {
+                    return res.status(503).json({
+                        success: false,
+                        message: 'AI service is currently overloaded. Please try again in a few minutes.',
+                        errorType: 'SERVICE_OVERLOADED',
+                        retryAfter: 60000
+                    });
+                }
+
+                if (error.message.includes('429') || error.message.includes('rate limit')) {
+                    return res.status(429).json({
+                        success: false,
+                        message: 'Rate limit exceeded. Please wait before making another request.',
+                        errorType: 'RATE_LIMITED',
+                        retryAfter: 30000
+                    });
+                }
+
+                throw error;
+            }
+        }
+
+        console.log("✅ Generation completed successfully");
 
         res.json({
-            sheets: availableSheets,
-            spreadsheetId
+            success: true,
+            testCases: generateTestCases ? testCases : [],
+            testScenarios: generateTestScenarios ? testScenarios : [],
+            createdSheets,
+            message: `Successfully ${createdSheets.map(s => `${s.action} ${s.count} ${s.type === 'testCases' ? 'test cases' : 'test scenarios'} ${s.action === 'appended' ? 'to' : 'in'} "${s.name}"`).join(' and ')}`
         });
 
     } catch (error) {
-        console.error('Error getting available sheets:', error);
+        console.error('❌ Error in generateTestCasesWithOptions:', error);
+
+        // Handle different types of errors
+        if (error.message.includes('Authentication')) {
+            return res.status(401).json({
+                success: false,
+                message: 'Authentication failed. Please reconnect your Google Sheets.',
+                errorType: 'AUTH_ERROR'
+            });
+        }
+
+        if (error.message.includes('Permission')) {
+            return res.status(403).json({
+                success: false,
+                message: 'Permission denied. Please check your Google Sheets permissions.',
+                errorType: 'PERMISSION_ERROR'
+            });
+        }
+
+        if (error.message.includes('not found')) {
+            return res.status(404).json({
+                success: false,
+                message: 'Spreadsheet or sheet not found. Please check your selection.',
+                errorType: 'NOT_FOUND'
+            });
+        }
+
+        // Generic error response
         res.status(500).json({
-            message: 'Failed to get available sheets',
-            error: error.message
+            success: false,
+            message: 'An unexpected error occurred. Please try again.',
+            errorType: 'INTERNAL_ERROR',
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined
         });
     }
 };
 
-// Enhanced function to generate test cases with proper formatting
-
-function parseTestScenariosJSON(text) {
-    console.log("🔍 Starting test scenarios JSON parsing...");
-
-    let cleanedText = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-
-    const startIndex = cleanedText.indexOf('[');
-    const endIndex = cleanedText.lastIndexOf(']');
-
-    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
-        console.log("❌ No valid JSON array boundaries found for scenarios");
-        return getFallbackTestScenarios();
-    }
-
-    const jsonString = cleanedText.substring(startIndex, endIndex + 1);
-
-    try {
-        const parsed = JSON.parse(jsonString);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-            console.log("✅ Test scenarios JSON parsing successful");
-            return validateAndCleanTestScenarios(parsed);
-        }
-    } catch (error) {
-        console.log("❌ Test scenarios parsing failed:", error.message);
-    }
-
-    console.log("❌ Test scenarios parsing failed, using fallback");
-    return getFallbackTestScenarios();
-}
-
-
-function validateAndCleanTestScenarios(scenarios) {
-    return scenarios.map((scenario, index) => ({
-        id: scenario.id || `TS_${(index + 1)}`,
-        module: scenario.module || '',
-        condition: scenario.condition || '',
-        testScenarios: scenario.testScenarios || scenario.description || `Test Scenario ${index + 1} Description`,
-        status: scenario.status || 'Not Tested'
-    })).filter(scenario => scenario.testScenarios);
-}
-
-function getFallbackTestScenarios() {
-    const fallbackScenarios = [];
-    const conditions = ['Using Valid Credentials for Login', 'Using Invalid Credentials for Login', 'Forgot Password', 'Language Change', 'Attempt with empty fields'];
-
-    for (let i = 1; i <= 10; i++) {
-        fallbackScenarios.push({
-            id: `TS_${i}`,
-            module: 'Test Module',
-            condition: conditions[(i - 1) % conditions.length] || 'Default Condition',
-            testScenarios: `Test Scenario ${i}: End-to-end workflow testing for the module functionality`,
-            status: 'Not Tested'
-        });
-    }
-    return fallbackScenarios;
-}
-
-// Enhanced function to update existing sheet columns to match the image format
 export const updateSheetFormatting = async (req, res) => {
     try {
         const { spreadsheetId, sheetName } = req.body;
         const userId = req.user._id.toString();
 
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
+        const sheets = await getAuthenticatedSheetsClient(userId);
 
         // Get sheet ID
         const spreadsheetInfo = await sheets.spreadsheets.get({
@@ -1004,7 +874,7 @@ export const updateSheetFormatting = async (req, res) => {
             }
         });
 
-        // Apply the formatting as defined in the previous function
+        // Apply the formatting
         const formatRequests = [
             // Header formatting
             {
@@ -1061,1207 +931,3 @@ export const updateSheetFormatting = async (req, res) => {
         });
     }
 };
-
-// Robust JSON parser for Gemini responses
-function parseGeminiJSON(text) {
-    console.log("🔍 Starting JSON parsing...");
-    console.log("📄 Raw text length:", text.length);
-    console.log("📄 First 500 chars:", text.substring(0, 500));
-
-    let cleanedText = text.replace(/```json\s*/g, '').replace(/```\s*/g, '').trim();
-
-    const startIndex = cleanedText.indexOf('[');
-    const endIndex = cleanedText.lastIndexOf(']');
-
-    if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
-        console.log("❌ No valid JSON array boundaries found");
-        console.log("🔧 Using fallback test cases");
-        return getFallbackTestCases();
-    }
-
-    const jsonString = cleanedText.substring(startIndex, endIndex + 1);
-    console.log("📝 Extracted JSON string length:", jsonString.length);
-    console.log("📝 First 200 chars of JSON:", jsonString.substring(0, 200));
-
-    // Strategy 1: Direct parsing
-    try {
-        const parsed = JSON.parse(jsonString);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-            console.log("✅ Direct JSON parsing successful");
-            console.log("📊 Parsed", parsed.length, "test cases");
-            const cleaned = validateAndCleanTestCases(parsed);
-            console.log("📊 After validation:", cleaned.length, "test cases");
-            return cleaned;
-        }
-    } catch (error) {
-        console.log("❌ Direct parsing failed:", error.message);
-    }
-
-    // Strategy 2: Fix common JSON issues
-    try {
-        let fixedJson = jsonString
-            .replace(/,(\s*[}\]])/g, '$1')  // Remove trailing commas
-            .replace(/\n/g, '\\n')          // Escape newlines
-            .replace(/\r/g, '\\r')          // Escape carriage returns
-            .replace(/\t/g, '\\t');         // Escape tabs
-
-        console.log("🔧 Attempting to parse fixed JSON...");
-        const parsed = JSON.parse(fixedJson);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-            console.log("✅ Fixed JSON parsing successful");
-            return validateAndCleanTestCases(parsed);
-        }
-    } catch (error) {
-        console.log("❌ Fixed JSON parsing failed:", error.message);
-    }
-
-    // Strategy 3: Manual parsing
-    console.log("🔧 Attempting manual parsing...");
-    const manualParsed = manuallyParseTestCases(text);
-    if (manualParsed.length > 0) {
-        console.log("✅ Manual parsing successful");
-        return manualParsed;
-    }
-
-    console.log("❌ All parsing strategies failed, using fallback");
-    return getFallbackTestCases();
-}
-
-function validateAndCleanTestCases(testCases) {
-    return testCases.map((tc, index) => {
-        let steps = tc.testSteps || tc.steps;
-        if (Array.isArray(steps)) {
-            steps = steps.join('\n');
-        }
-
-        return {
-            id: tc.id || `PC_${(index + 1)}`,
-            module: tc.module || '',
-            submodule: tc.submodule || '',
-            summary: tc.summary || tc.title || `Test Case ${index + 1}`,
-            testSteps: steps || '',
-            expectedResults: tc.expectedResults || tc.expectedResult || '',
-            testCaseType: tc.testCaseType || 'Positive',
-            environment: tc.environment || 'Test',
-            status: tc.status || 'Not Tested'
-        };
-    }).filter(tc => tc.summary);
-}
-
-function manuallyParseTestCases(text) {
-    const testCases = [];
-    const tcRegex = /"id":\s*"(PC_\d+)"/g;  // Changed from TC to PC_
-    const matches = [...text.matchAll(tcRegex)];
-
-    console.log(`🔍 Found ${matches.length} test case IDs manually`);
-
-    for (let i = 0; i < matches.length; i++) {
-        const tcId = matches[i][1];
-        const startPos = matches[i].index;
-        const endPos = i < matches.length - 1 ? matches[i + 1].index : text.length;
-        const tcText = text.substring(startPos, endPos);
-
-        const testCase = {
-            id: tcId,
-            module: extractField(tcText, 'module'),
-            submodule: extractField(tcText, 'submodule'),
-            summary: extractField(tcText, 'summary'),
-            testSteps: extractField(tcText, 'testSteps'),
-            expectedResults: extractField(tcText, 'expectedResults'),
-            testCaseType: extractField(tcText, 'testCaseType') || 'Positive',
-            environment: extractField(tcText, 'environment') || 'Test',
-            status: extractField(tcText, 'status') || 'Not Tested'
-        };
-
-        if (testCase.summary) {
-            testCases.push(testCase);
-        }
-    }
-
-    return testCases;
-}
-
-function extractField(text, fieldName) {
-    const regex = new RegExp(`"${fieldName}":\\s*"([^"]*)"`, 'i');
-    const match = text.match(regex);
-    return match ? match[1].replace(/\\n/g, '\n') : '';
-}
-
-function getFallbackTestCases() {
-    const fallbackCases = [];
-    for (let i = 1; i <= 20; i++) {
-        fallbackCases.push({
-            id: `PC_${i}`,
-            module: 'Test Module',
-            submodule: 'Test Submodule',
-            summary: `Test Case ${i} Summary`,
-            testSteps: `Step 1. Perform action for test case ${i}\nStep 2. Verify result\nStep 3. Validate outcome`,
-            expectedResults: `Expected result for test case ${i}`,
-            testCaseType: i % 4 === 0 ? 'Negative' : 'Positive',
-            environment: 'Test',
-            status: 'Not Tested'
-        });
-    }
-    return fallbackCases;
-}
-
-
-export const generateTestCasesWithOptions = async (req, res) => {
-    try {
-        const {
-            module,
-            summary,
-            acceptanceCriteria,
-            spreadsheetId,
-            generateTestCases = true,
-            generateTestScenarios = true,
-            testCasesCount = 20,
-            testScenariosCount = 10,
-            // NEW: Sheet selection options
-            testCasesSheetName = null,  // If provided, append to existing sheet
-            testScenariosSheetName = null  // If provided, append to existing sheet
-        } = req.body;
-
-        const userId = req.user._id.toString();
-
-        console.log("🔧 Generate with options for user:", userId);
-        console.log("📋 Options:", {
-            generateTestCases,
-            generateTestScenarios,
-            testCasesCount,
-            testScenariosCount,
-            testCasesSheetName,
-            testScenariosSheetName
-        });
-
-        const userToken = await UserToken.findOne({ userId: userId });
-        if (!userToken) {
-            return res.status(401).json({ message: 'Google Sheets not connected' });
-        }
-
-        const tokens = {
-            access_token: userToken.accessToken,
-            refresh_token: userToken.refreshToken,
-            expiry_date: userToken.expiryDate.getTime()
-        };
-
-        oauth2Client.setCredentials(tokens);
-        const sheets = google.sheets({ version: 'v4', auth: oauth2Client });
-
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-        const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
-
-        let testCases = [];
-        let testScenarios = [];
-        let createdSheets = [];
-
-        // Generate Test Cases if requested
-        if (generateTestCases) {
-            const testCasesPrompt = `
-Generate comprehensive test cases for the following software feature:
-
-Module: ${module}
-Summary: ${summary}
-Acceptance Criteria: ${acceptanceCriteria}
-
-Create EXACTLY ${testCasesCount} detailed test cases in valid JSON format. Each test case must follow this exact structure:
-
-[
-  {
-    "id": "PC_1",
-    "module": "${module}",
-    "submodule": "Specific submodule/component within ${module}",
-    "summary": "Clear, concise test case description (what is being tested)",
-    "testSteps": "Step 1. Detailed action to perform\\nStep 2. Specific verification step\\nStep 3. Expected result validation",
-    "expectedResults": "Detailed description of expected outcome",
-    "testCaseType": "Positive",
-    "environment": "Test",
-    "status": "Not Tested"
-  }
-]
-
-IMPORTANT REQUIREMENTS:
-1. Use EXACTLY the ID format: PC_1, PC_2, PC_3, ..., PC_${testCasesCount}
-2. Module field should always be: "${module}"
-3. Create meaningful submodules that represent different components/areas within ${module}
-4. Include both Positive and Negative test cases (70% Positive, 30% Negative)
-5. Use \\n for line breaks in testSteps field (not actual line breaks)
-6. Make testSteps detailed with numbered steps
-7. Environment should be "Test" for all test cases
-8. Status should be "Not Tested" for all test cases
-9. Summary should be concise but descriptive
-10. ExpectedResults should be detailed and specific
-
-Test Case Distribution:
-- 70% Positive test cases
-- 30% Negative test cases
-- Cover all aspects mentioned in the acceptance criteria
-- Include edge cases and boundary conditions
-- Create logical submodules based on the functionality
-
-Return ONLY the JSON array with exactly ${testCasesCount} test cases, no markdown formatting, no code blocks, no additional text.
-`;
-
-            console.log("🤖 Generating test cases...");
-            const testCasesResult = await model.generateContent(testCasesPrompt);
-            const testCasesResponse = await testCasesResult.response;
-            let testCasesText = testCasesResponse.text();
-            testCases = parseGeminiJSON(testCasesText);
-
-            if (testCases.length > 0) {
-                let finalTestCasesSheetName;
-
-                // Check if user wants to append to existing sheet
-                if (testCasesSheetName && testCasesSheetName.trim()) {
-                    finalTestCasesSheetName = testCasesSheetName.trim();
-                    console.log("📝 Appending test cases to existing sheet:", finalTestCasesSheetName);
-
-                    // Append to existing sheet
-                    await appendTestCasesToExistingSheet(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
-                } else {
-                    // Create new sheet
-                    finalTestCasesSheetName = `Test Cases - ${module} - ${timestamp}`;
-                    console.log("📝 Creating new test cases sheet:", finalTestCasesSheetName);
-
-                    await sheets.spreadsheets.batchUpdate({
-                        spreadsheetId,
-                        requestBody: {
-                            requests: [{
-                                addSheet: {
-                                    properties: {
-                                        title: finalTestCasesSheetName,
-                                        gridProperties: {
-                                            rowCount: 100,
-                                            columnCount: 10
-                                        }
-                                    }
-                                }
-                            }]
-                        }
-                    });
-
-                    // Add test cases data and formatting to new sheet
-                    await addTestCasesSheetData(sheets, spreadsheetId, finalTestCasesSheetName, testCases, module);
-                }
-
-                createdSheets.push({
-                    type: 'testCases',
-                    name: finalTestCasesSheetName,
-                    count: testCases.length,
-                    action: testCasesSheetName ? 'appended' : 'created'
-                });
-            }
-        }
-
-        // Generate Test Scenarios if requested
-        if (generateTestScenarios) {
-            const testScenariosPrompt = `
-Generate test scenarios for the following software feature:
-
-Module: ${module}
-Summary: ${summary}
-Acceptance Criteria: ${acceptanceCriteria}
-
-Create EXACTLY ${testScenariosCount} test scenarios in valid JSON format. Each test scenario must follow this exact structure:
-
-[
-  {
-    "id": "TS_1",
-    "module": "${module}",
-    "condition": "Specific condition or state for this test scenario",
-    "testScenarios": "Detailed description of the test scenario covering a complete user workflow or business process",
-    "status": "Not Tested"
-  }
-]
-
-IMPORTANT REQUIREMENTS:
-1. Use EXACTLY the ID format: TS_1, TS_2, TS_3, ..., TS_${testScenariosCount}
-2. Module field should always be: "${module}"
-3. Condition should describe the specific state, input, or situation being tested
-4. testScenarios should be a detailed description of the complete workflow
-5. Status should always be "Not Tested" for all scenarios
-6. Cover different conditions like:
-   - Valid/Invalid inputs
-   - Different user states (logged in/guest)
-   - Various system conditions
-   - Error scenarios
-   - Edge cases
-
-Examples of good test scenarios:
-- Condition: "Using Valid Credentials for Login"
-  Test Scenario: "Successful login with valid email and password, followed by navigation to the main dashboard."
-  
-- Condition: "Using Invalid Credentials for Login" 
-  Test Scenario: "Login failure due to incorrect password, verifying error message display and retry functionality."
-
-- Condition: "Forgot Password"
-  Test Scenario: "Successful password reset starting from the Forgot Password link to successful login with new password."
-
-Return ONLY the JSON array with exactly ${testScenariosCount} test scenarios, no markdown formatting, no code blocks, no additional text.
-`;
-
-            console.log("🤖 Generating test scenarios...");
-            const testScenariosResult = await model.generateContent(testScenariosPrompt);
-            const testScenariosResponse = await testScenariosResult.response;
-            let testScenariosText = testScenariosResponse.text();
-            testScenarios = parseTestScenariosJSON(testScenariosText);
-
-            if (testScenarios.length > 0) {
-                let finalTestScenariosSheetName;
-
-                // Check if user wants to append to existing sheet
-                if (testScenariosSheetName && testScenariosSheetName.trim()) {
-                    finalTestScenariosSheetName = testScenariosSheetName.trim();
-                    console.log("📝 Appending test scenarios to existing sheet:", finalTestScenariosSheetName);
-
-                    // Append to existing sheet
-                    await appendTestScenariosToExistingSheet(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
-                } else {
-                    // Create new sheet
-                    finalTestScenariosSheetName = `Test Scenarios - ${module} - ${timestamp}`;
-                    console.log("📝 Creating new test scenarios sheet:", finalTestScenariosSheetName);
-
-                    await sheets.spreadsheets.batchUpdate({
-                        spreadsheetId,
-                        requestBody: {
-                            requests: [{
-                                addSheet: {
-                                    properties: {
-                                        title: finalTestScenariosSheetName,
-                                        gridProperties: {
-                                            rowCount: 50,
-                                            columnCount: 3
-                                        }
-                                    }
-                                }
-                            }]
-                        }
-                    });
-
-                    // Add test scenarios data and formatting to new sheet
-                    await addTestScenariosSheetData(sheets, spreadsheetId, finalTestScenariosSheetName, testScenarios, module);
-                }
-
-                createdSheets.push({
-                    type: 'testScenarios',
-                    name: finalTestScenariosSheetName,
-                    count: testScenarios.length,
-                    action: testScenariosSheetName ? 'appended' : 'created'
-                });
-            }
-        }
-
-        console.log("✅ Generation completed successfully");
-
-        res.json({
-            success: true,
-            testCases: generateTestCases ? testCases : [],
-            testScenarios: generateTestScenarios ? testScenarios : [],
-            createdSheets,
-            message: `Successfully ${createdSheets.map(s => `${s.action} ${s.count} ${s.type === 'testCases' ? 'test cases' : 'test scenarios'} ${s.action === 'appended' ? 'to' : 'in'} "${s.name}"`).join(' and ')}`
-        });
-
-    } catch (error) {
-        console.error('Error generating with options:', error);
-        res.status(500).json({
-            message: 'Failed to generate content',
-            error: error.message
-        });
-    }
-};
-
-// NEW: Function to append test cases to existing sheet
-async function appendTestCasesToExistingSheet(sheets, spreadsheetId, sheetName, testCases, module) {
-    try {
-        // Get existing data to find the next available row
-        const existingData = await sheets.spreadsheets.values.get({
-            spreadsheetId,
-            range: `'${sheetName}'!A:J`,
-        });
-
-        const existingRows = existingData.data.values || [];
-        const nextRow = existingRows.length + 1;
-
-        console.log(`📍 Appending ${testCases.length} test cases starting at row ${nextRow}`);
-
-        // Prepare new test case data (without header)
-        const newTestCasesData = testCases.map(testCase => [
-            testCase.id || '',
-            testCase.module || module,
-            testCase.submodule || '',
-            testCase.summary || '',
-            testCase.testSteps || '',
-            testCase.expectedResults || '',
-            '', // Actual Result - empty initially
-            testCase.testCaseType || 'Positive',
-            testCase.environment || 'Test',
-            testCase.status || 'Not Tested'
-        ]);
-
-        // Append the new data
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: `'${sheetName}'!A${nextRow}`,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: { values: newTestCasesData }
-        });
-
-        console.log("✅ Test cases appended successfully");
-        return true;
-    } catch (error) {
-        console.error('Error appending test cases:', error);
-        throw error;
-    }
-}
-
-// NEW: Function to append test scenarios to existing sheet
-async function appendTestScenariosToExistingSheet(sheets, spreadsheetId, sheetName, testScenarios, module) {
-    try {
-        // Get existing data to find the next available row
-        const existingData = await sheets.spreadsheets.values.get({
-            spreadsheetId,
-            range: `'${sheetName}'!A:D`,  // Updated to 4 columns
-        });
-
-        const existingRows = existingData.data.values || [];
-        const nextRow = existingRows.length + 1;
-
-        console.log(`📍 Appending ${testScenarios.length} test scenarios starting at row ${nextRow}`);
-
-        // Prepare new test scenario data (without header) - Updated format
-        const newTestScenariosData = testScenarios.map(scenario => [
-            scenario.module || module,
-            scenario.condition || '',
-            scenario.testScenarios || '',
-            scenario.status || 'Not Tested'
-        ]);
-
-        // Append the new data
-        await sheets.spreadsheets.values.update({
-            spreadsheetId,
-            range: `'${sheetName}'!A${nextRow}`,
-            valueInputOption: 'USER_ENTERED',
-            requestBody: { values: newTestScenariosData }
-        });
-
-        console.log("✅ Test scenarios appended successfully");
-        return true;
-    } catch (error) {
-        console.error('Error appending test scenarios:', error);
-        throw error;
-    }
-}
-
-
-// Helper function to add test cases sheet data
-async function addTestCasesSheetData(sheets, spreadsheetId, sheetName, testCases, module) {
-    // Get sheet ID for formatting
-    const spreadsheetInfo = await sheets.spreadsheets.get({
-        spreadsheetId,
-        fields: 'sheets.properties'
-    });
-
-    const sheet = spreadsheetInfo.data.sheets.find(s => s.properties.title === sheetName);
-    const sheetId = sheet.properties.sheetId;
-
-    // Prepare Test Cases Sheet Data
-    const testCasesHeaderRow = [
-        'Test Case ID',
-        'Module',
-        'Submodule',
-        'Summary',
-        'Test Steps',
-        'Expected Results',
-        'Actual Result',
-        'Test Case Type',
-        'Environment',
-        'Status'
-    ];
-
-    const testCasesDataRows = testCases.map(testCase => [
-        testCase.id || '',
-        testCase.module || module,
-        testCase.submodule || '',
-        testCase.summary || '',
-        testCase.testSteps || '',
-        testCase.expectedResults || '',
-        '', // Actual Result - empty initially
-        testCase.testCaseType || 'Positive',
-        testCase.environment || 'Test',
-        testCase.status || 'Not Tested'
-    ]);
-
-    const testCasesAllData = [testCasesHeaderRow, ...testCasesDataRows];
-
-    // Insert data into test cases sheet
-    await sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `'${sheetName}'!A1`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: { values: testCasesAllData }
-    });
-
-    // FIXED: Apply formatting to Test Cases Sheet with corrected conditional formatting
-    const testCasesFormatRequests = [
-        // Format header row - keep your colors
-        {
-            repeatCell: {
-                range: {
-                    sheetId: sheetId,
-                    startRowIndex: 0,
-                    endRowIndex: 1,
-                    startColumnIndex: 0,
-                    endColumnIndex: 10
-                },
-                cell: {
-                    userEnteredFormat: {
-                        backgroundColor: {
-                            red: 0.047,
-                            green: 0.204,
-                            blue: 0.239
-                        },
-                        textFormat: {
-                            foregroundColor: {
-                                red: 1.0,
-                                green: 1.0,
-                                blue: 1.0
-                            },
-                            bold: true,
-                            fontSize: 11
-                        },
-                        horizontalAlignment: 'CENTER',
-                        verticalAlignment: 'MIDDLE',
-                        padding: {
-                            top: 8,
-                            bottom: 8,
-                            left: 4,
-                            right: 4
-                        }
-                    }
-                },
-                fields: 'userEnteredFormat'
-            }
-        },
-        // Set better column widths for test cases
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 0,
-                    endIndex: 1
-                },
-                properties: { pixelSize: 120 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 1,
-                    endIndex: 2
-                },
-                properties: { pixelSize: 100 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 2,
-                    endIndex: 3
-                },
-                properties: { pixelSize: 130 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 3,
-                    endIndex: 4
-                },
-                properties: { pixelSize: 220 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 4,
-                    endIndex: 5
-                },
-                properties: { pixelSize: 300 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 5,
-                    endIndex: 6
-                },
-                properties: { pixelSize: 250 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 6,
-                    endIndex: 7
-                },
-                properties: { pixelSize: 200 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 7,
-                    endIndex: 8
-                },
-                properties: { pixelSize: 120 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 8,
-                    endIndex: 9
-                },
-                properties: { pixelSize: 100 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 9,
-                    endIndex: 10
-                },
-                properties: { pixelSize: 100 },
-                fields: 'pixelSize'
-            }
-        },
-        // Set row heights for better spacing
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'ROWS',
-                    startIndex: 0,
-                    endIndex: 1
-                },
-                properties: { pixelSize: 35 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'ROWS',
-                    startIndex: 1,
-                    endIndex: testCases.length + 1
-                },
-                properties: { pixelSize: 80 },
-                fields: 'pixelSize'
-            }
-        },
-        // Format data rows with better spacing
-        {
-            repeatCell: {
-                range: {
-                    sheetId: sheetId,
-                    startRowIndex: 1,
-                    endRowIndex: testCases.length + 1,
-                    startColumnIndex: 0,
-                    endColumnIndex: 10
-                },
-                cell: {
-                    userEnteredFormat: {
-                        textFormat: {
-                            fontSize: 10
-                        },
-                        verticalAlignment: 'TOP',
-                        wrapStrategy: 'WRAP',
-                        padding: {
-                            top: 6,
-                            bottom: 6,
-                            left: 6,
-                            right: 6
-                        }
-                    }
-                },
-                fields: 'userEnteredFormat'
-            }
-        },
-        // FIXED: Test Case Type conditional formatting - index moved outside rule
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testCases.length + 1,
-                        startColumnIndex: 7,
-                        endColumnIndex: 8
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Positive' }] },
-                        format: { backgroundColor: { red: 0.85, green: 0.95, blue: 0.85 } }
-                    }
-                },
-                index: 0
-            }
-        },
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testCases.length + 1,
-                        startColumnIndex: 7,
-                        endColumnIndex: 8
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Negative' }] },
-                        format: { backgroundColor: { red: 1.0, green: 0.85, blue: 0.85 } }
-                    }
-                },
-                index: 1
-            }
-        },
-        // FIXED: Status conditional formatting - index moved outside rule
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testCases.length + 1,
-                        startColumnIndex: 9,
-                        endColumnIndex: 10
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Pass' }] },
-                        format: {
-                            backgroundColor: { red: 0.0, green: 0.5, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
-                        }
-                    }
-                },
-                index: 2
-            }
-        },
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testCases.length + 1,
-                        startColumnIndex: 9,
-                        endColumnIndex: 10
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Fail' }] },
-                        format: {
-                            backgroundColor: { red: 0.6, green: 0.0, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
-                        }
-                    }
-                },
-                index: 3
-            }
-        },
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testCases.length + 1,
-                        startColumnIndex: 9,
-                        endColumnIndex: 10
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Blocked' }] },
-                        format: {
-                            backgroundColor: { red: 1.0, green: 1.0, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 0.0, green: 0.0, blue: 0.0 } }
-                        }
-                    }
-                },
-                index: 4
-            }
-        }
-    ];
-
-    // Apply all formatting
-    await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: testCasesFormatRequests }
-    });
-
-    // Add data validation for Test Cases sheet
-    await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-            requests: [
-                {
-                    setDataValidation: {
-                        range: {
-                            sheetId: sheetId,
-                            startRowIndex: 1,
-                            endRowIndex: testCases.length + 1,
-                            startColumnIndex: 7,
-                            endColumnIndex: 8
-                        },
-                        rule: {
-                            condition: {
-                                type: 'ONE_OF_LIST',
-                                values: [
-                                    { userEnteredValue: 'Positive' },
-                                    { userEnteredValue: 'Negative' }
-                                ]
-                            },
-                            showCustomUi: true,
-                            strict: true
-                        }
-                    }
-                },
-                {
-                    setDataValidation: {
-                        range: {
-                            sheetId: sheetId,
-                            startRowIndex: 1,
-                            endRowIndex: testCases.length + 1,
-                            startColumnIndex: 9,
-                            endColumnIndex: 10
-                        },
-                        rule: {
-                            condition: {
-                                type: 'ONE_OF_LIST',
-                                values: [
-                                    { userEnteredValue: 'Not Tested' },
-                                    { userEnteredValue: 'Pass' },
-                                    { userEnteredValue: 'Fail' },
-                                    { userEnteredValue: 'Blocked' }
-                                ]
-                            },
-                            showCustomUi: true,
-                            strict: true
-                        }
-                    }
-                }
-            ]
-        }
-    });
-}
-
-// Helper function to add test scenarios sheet data
-async function addTestScenariosSheetData(sheets, spreadsheetId, sheetName, testScenarios, module) {
-    // Get sheet ID for formatting
-    const spreadsheetInfo = await sheets.spreadsheets.get({
-        spreadsheetId,
-        fields: 'sheets.properties'
-    });
-
-    const sheet = spreadsheetInfo.data.sheets.find(s => s.properties.title === sheetName);
-    const sheetId = sheet.properties.sheetId;
-
-    // Updated Test Scenarios Sheet Data with new format
-    const testScenariosHeaderRow = [
-        'Module',
-        'Condition', 
-        'Test Scenarios',
-        'Status'
-    ];
-
-    const testScenariosDataRows = testScenarios.map(scenario => [
-        scenario.module || module,
-        scenario.condition || '',
-        scenario.testScenarios || '',
-        scenario.status || 'Not Tested'
-    ]);
-
-    const testScenariosAllData = [testScenariosHeaderRow, ...testScenariosDataRows];
-
-    // Insert data into test scenarios sheet
-    await sheets.spreadsheets.values.update({
-        spreadsheetId,
-        range: `'${sheetName}'!A1`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: { values: testScenariosAllData }
-    });
-
-    // Updated formatting for Test Scenarios Sheet with 4 columns
-    const testScenariosFormatRequests = [
-        // Format header row - same style as test cases
-        {
-            repeatCell: {
-                range: {
-                    sheetId: sheetId,
-                    startRowIndex: 0,
-                    endRowIndex: 1,
-                    startColumnIndex: 0,
-                    endColumnIndex: 4  // Updated to 4 columns
-                },
-                cell: {
-                    userEnteredFormat: {
-                        backgroundColor: {
-                            red: 0.047,
-                            green: 0.204,
-                            blue: 0.239
-                        },
-                        textFormat: {
-                            foregroundColor: {
-                                red: 1.0,
-                                green: 1.0,
-                                blue: 1.0
-                            },
-                            bold: true,
-                            fontSize: 11
-                        },
-                        horizontalAlignment: 'CENTER',
-                        verticalAlignment: 'MIDDLE',
-                        padding: {
-                            top: 8,
-                            bottom: 8,
-                            left: 4,
-                            right: 4
-                        }
-                    }
-                },
-                fields: 'userEnteredFormat'
-            }
-        },
-        // Updated column widths for 4 columns
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 0,
-                    endIndex: 1
-                },
-                properties: { pixelSize: 150 },  // Module
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 1,
-                    endIndex: 2
-                },
-                properties: { pixelSize: 250 },  // Condition
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 2,
-                    endIndex: 3
-                },
-                properties: { pixelSize: 400 },  // Test Scenarios
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'COLUMNS',
-                    startIndex: 3,
-                    endIndex: 4
-                },
-                properties: { pixelSize: 100 },  // Status
-                fields: 'pixelSize'
-            }
-        },
-        // Set row heights for scenarios
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'ROWS',
-                    startIndex: 0,
-                    endIndex: 1
-                },
-                properties: { pixelSize: 35 },
-                fields: 'pixelSize'
-            }
-        },
-        {
-            updateDimensionProperties: {
-                range: {
-                    sheetId: sheetId,
-                    dimension: 'ROWS',
-                    startIndex: 1,
-                    endIndex: testScenarios.length + 1
-                },
-                properties: { pixelSize: 60 },
-                fields: 'pixelSize'
-            }
-        },
-        // Format data rows for scenarios with spacing
-        {
-            repeatCell: {
-                range: {
-                    sheetId: sheetId,
-                    startRowIndex: 1,
-                    endRowIndex: testScenarios.length + 1,
-                    startColumnIndex: 0,
-                    endColumnIndex: 4  // Updated to 4 columns
-                },
-                cell: {
-                    userEnteredFormat: {
-                        textFormat: {
-                            fontSize: 10
-                        },
-                        verticalAlignment: 'TOP',
-                        wrapStrategy: 'WRAP',
-                        padding: {
-                            top: 6,
-                            bottom: 6,
-                            left: 6,
-                            right: 6
-                        }
-                    }
-                },
-                fields: 'userEnteredFormat'
-            }
-        },
-        // Add conditional formatting for Status column
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testScenarios.length + 1,
-                        startColumnIndex: 3,
-                        endColumnIndex: 4
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Pass' }] },
-                        format: {
-                            backgroundColor: { red: 0.0, green: 0.5, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
-                        }
-                    }
-                },
-                index: 0
-            }
-        },
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testScenarios.length + 1,
-                        startColumnIndex: 3,
-                        endColumnIndex: 4
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Fail' }] },
-                        format: {
-                            backgroundColor: { red: 0.6, green: 0.0, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 1.0, green: 1.0, blue: 1.0 } }
-                        }
-                    }
-                },
-                index: 1
-            }
-        },
-        {
-            addConditionalFormatRule: {
-                rule: {
-                    ranges: [{
-                        sheetId: sheetId,
-                        startRowIndex: 1,
-                        endRowIndex: testScenarios.length + 1,
-                        startColumnIndex: 3,
-                        endColumnIndex: 4
-                    }],
-                    booleanRule: {
-                        condition: { type: 'TEXT_EQ', values: [{ userEnteredValue: 'Blocked' }] },
-                        format: {
-                            backgroundColor: { red: 1.0, green: 1.0, blue: 0.0 },
-                            textFormat: { foregroundColor: { red: 0.0, green: 0.0, blue: 0.0 } }
-                        }
-                    }
-                },
-                index: 2
-            }
-        }
-    ];
-
-    // Apply all formatting for scenarios
-    await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: { requests: testScenariosFormatRequests }
-    });
-
-    // Add data validation for Status column
-    await sheets.spreadsheets.batchUpdate({
-        spreadsheetId,
-        requestBody: {
-            requests: [
-                {
-                    setDataValidation: {
-                        range: {
-                            sheetId: sheetId,
-                            startRowIndex: 1,
-                            endRowIndex: testScenarios.length + 1,
-                            startColumnIndex: 3,
-                            endColumnIndex: 4
-                        },
-                        rule: {
-                            condition: {
-                                type: 'ONE_OF_LIST',
-                                values: [
-                                    { userEnteredValue: 'Not Tested' },
-                                    { userEnteredValue: 'Pass' },
-                                    { userEnteredValue: 'Fail' },
-                                    { userEnteredValue: 'Blocked' }
-                                ]
-                            },
-                            showCustomUi: true,
-                            strict: true
-                        }
-                    }
-                }
-            ]
-        }
-    });
-}
