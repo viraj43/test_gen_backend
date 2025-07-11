@@ -13,9 +13,11 @@ import {
     appendTestScenariosToExistingSheet,
     addTestCasesSheetData,
     addTestScenariosSheetData,
-    // ADD THESE NEW IMPORTS:
     updateGenerateTestCasesPrompt,
-    parseGeminiJSONEnhanced
+    parseGeminiJSONEnhanced,
+    // ADD THESE TWO MISSING FUNCTIONS:
+    analyzeScenarioGaps,
+    createGapFillingTestScenariosPrompt
 } from '../lib/sheetsHelpers.js';
 import dotenv from "dotenv";
 dotenv.config();
@@ -570,6 +572,7 @@ export const generateTestCasesWithOptions = async (req, res) => {
                     })).filter(ts => ts.testScenarios);
 
                     if (existingTestScenarios.length > 0) {
+                        existingTestScenariosContext = createCompactTestScenariosContext(existingTestScenarios, testScenariosSheetName);
                         console.log(`🔍 Analyzing gaps in ${existingTestScenarios.length} existing scenarios...`);
 
                         // Analyze what's missing
@@ -623,9 +626,10 @@ export const generateTestCasesWithOptions = async (req, res) => {
             let existingTestCasesForValidation = [];
 
             if (existingTestCasesContext) {
-                const lastIdMatch = existingTestCasesContext.match(/Last ID: PC_(\d+)/);
+                const lastIdMatch = existingTestCasesContext.match(/Last ID: ([A-Z]+_\d+)/);
                 if (lastIdMatch) {
-                    nextIdNumber = parseInt(lastIdMatch[1]) + 1;
+                    const idParts = lastIdMatch[1].split('_');
+                    nextIdNumber = parseInt(idParts[1]) + 1;
                 }
 
                 // Get existing test cases for validation

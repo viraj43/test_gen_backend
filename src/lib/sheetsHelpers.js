@@ -359,11 +359,11 @@ export function analyzeScenarioGaps(existingScenarios, module, acceptanceCriteri
     // Extract covered functionality from existing scenarios
     const coveredFunctionality = new Set();
     const existingConditions = existingScenarios.map(scenario => scenario.condition.toLowerCase());
-    
+
     existingScenarios.forEach(scenario => {
         const condition = scenario.condition.toLowerCase();
         const description = scenario.testScenarios.toLowerCase();
-        
+
         // Extract key functional areas
         const functionalKeywords = extractFunctionalKeywords(condition + " " + description);
         functionalKeywords.forEach(keyword => coveredFunctionality.add(keyword));
@@ -371,10 +371,10 @@ export function analyzeScenarioGaps(existingScenarios, module, acceptanceCriteri
 
     // Define essential scenarios for the module based on acceptance criteria
     const essentialScenarios = generateEssentialScenariosMap(module, acceptanceCriteria);
-    
+
     // Find missing essential scenarios
     const missingScenarios = essentialScenarios.filter(essential => {
-        return !Array.from(coveredFunctionality).some(covered => 
+        return !Array.from(coveredFunctionality).some(covered =>
             essential.keywords.some(keyword => covered.includes(keyword))
         );
     });
@@ -534,12 +534,18 @@ CRITICAL: Only generate scenarios that fill actual gaps. Return ONLY JSON array 
 
 // ENHANCED: Update the main generation function to use these improvements
 export function updateGenerateTestCasesPrompt(module, summary, acceptanceCriteria, level, existingTestCasesContext, nextIdNumber) {
+    // Add fallback if context is empty
+    if (!existingTestCasesContext || existingTestCasesContext.trim() === "") {
+        console.log("⚠️ No existing context provided, generating fresh test cases");
+        existingTestCasesContext = "No existing test cases found.";
+    }
+
     return createAntiDuplicatePrompt(
-        module, 
-        summary, 
-        acceptanceCriteria, 
-        level, 
-        nextIdNumber, 
+        module,
+        summary,
+        acceptanceCriteria,
+        level,
+        nextIdNumber,
         existingTestCasesContext
     );
 }
