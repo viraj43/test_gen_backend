@@ -4,6 +4,20 @@ dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+const TEST_CASE_LEVELS = {
+    'Low': { min: 1, max: 5, focus: 'Critical paths only', coverage: 'Happy path + 1-2 critical negatives' },
+    'Medium': { min: 5, max: 15, focus: 'Core functionality + key negatives', coverage: 'Main workflows + input validation + error handling' },
+    'High': { min: 15, max: 25, focus: 'Comprehensive coverage + edge cases', coverage: 'All user paths + boundary testing + integration scenarios' },
+    'Detailed': { min: 25, max: 40, focus: 'Exhaustive testing + all scenarios', coverage: 'All permutations + stress testing + complex workflows' }
+};
+
+const TEST_SCENARIO_LEVELS = {
+    'Low': { min: 1, max: 3, focus: 'Happy path workflows', coverage: 'Primary success scenarios' },
+    'Medium': { min: 3, max: 8, focus: 'Core workflows + error paths', coverage: 'Success + failure workflows + recovery paths' },
+    'High': { min: 8, max: 15, focus: 'Complete user journeys', coverage: 'All user types + complex scenarios + integrations' },
+    'Detailed': { min: 15, max: 25, focus: 'All possible workflows + integrations', coverage: 'Every possible path + system integrations + edge workflows' }
+};
+
 // Analyze the intent behind the custom prompt
 export async function analyzePromptIntent(prompt, testCases) {
     const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
@@ -240,15 +254,60 @@ export function createCompactTestCasesContext(existingTestCases, sheetName) {
     return createEnhancedTestCasesContext(existingTestCases, sheetName);
 }
 
-// ENHANCED: Improved prompt with stronger duplicate prevention
-export function createAntiDuplicatePrompt(module, summary, acceptanceCriteria, testCasesCount, nextIdNumber, existingContext) {
+export function createAntiDuplicatePrompt(module, summary, acceptanceCriteria, level, nextIdNumber, existingContext) {
+    const levelConfig = TEST_CASE_LEVELS[level] || TEST_CASE_LEVELS['Medium'];
+    const testCasesCount = Math.round((levelConfig.min + levelConfig.max) / 2);
+
+    const levelInstructions = {
+        'Low': `
+LOW LEVEL FOCUS:
+- ONLY critical functionality that must work
+- 1-2 most important positive scenarios
+- 1-2 critical negative scenarios (invalid input, missing data)
+- Skip edge cases and complex integrations`,
+        'Medium': `
+MEDIUM LEVEL FOCUS:
+- Main functionality coverage
+- Primary positive workflows
+- Key negative scenarios (validation, error handling)
+- Basic boundary testing
+- Main user personas`,
+        'High': `
+HIGH LEVEL FOCUS:
+- Comprehensive functionality coverage
+- Complex positive workflows
+- Extensive negative testing
+- Boundary and edge case testing
+- Multiple user roles and permissions
+- Integration testing between components`,
+        'Detailed': `
+DETAILED LEVEL FOCUS:
+- Exhaustive coverage including rare scenarios
+- All possible workflow combinations
+- Complete negative testing matrix
+- Stress testing and load scenarios
+- All user types and permission combinations
+- Cross-browser/device compatibility
+- Integration with external systems`
+    };
+
+    const distributionMap = {
+        'Low': `- Critical Happy Paths: ${Math.ceil(testCasesCount * 0.60)} tests\n- Essential Validation: ${Math.ceil(testCasesCount * 0.40)} tests`,
+        'Medium': `- Happy Path Variations: ${Math.ceil(testCasesCount * 0.45)} tests\n- Input Validation: ${Math.ceil(testCasesCount * 0.30)} tests\n- Error Handling: ${Math.ceil(testCasesCount * 0.25)} tests`,
+        'High': `- Happy Path Variations: ${Math.ceil(testCasesCount * 0.35)} tests\n- Input Validation: ${Math.ceil(testCasesCount * 0.25)} tests\n- Error Handling: ${Math.ceil(testCasesCount * 0.20)} tests\n- Edge Cases & Boundaries: ${Math.ceil(testCasesCount * 0.15)} tests\n- Integration & Workflow: ${Math.ceil(testCasesCount * 0.05)} tests`,
+        'Detailed': `- Happy Path Complex Variations: ${Math.ceil(testCasesCount * 0.30)} tests\n- Comprehensive Input Validation: ${Math.ceil(testCasesCount * 0.25)} tests\n- Extensive Error Handling: ${Math.ceil(testCasesCount * 0.20)} tests\n- Edge Cases & Boundary Testing: ${Math.ceil(testCasesCount * 0.15)} tests\n- Integration & Cross-Component: ${Math.ceil(testCasesCount * 0.10)} tests`
+    };
+
     return `
 Generate ${testCasesCount} COMPLETELY UNIQUE test cases for: ${module}
+QUALITY LEVEL: ${level.toUpperCase()} (${levelConfig.focus})
 
 Summary: ${summary}
 Acceptance Criteria: ${acceptanceCriteria}
 
 ${existingContext}
+
+${levelInstructions[level] || levelInstructions['Medium']}
 
 ANTI-DUPLICATE REQUIREMENTS:
 1. Each test case must have a UNIQUE purpose and approach
@@ -258,20 +317,8 @@ ANTI-DUPLICATE REQUIREMENTS:
 5. Use different edge cases and boundary conditions
 6. Different error scenarios and recovery paths
 
-DIVERSITY GUIDELINES:
-- Vary input data types (valid, invalid, boundary, special characters)
-- Different user roles/permissions for each test
-- Various system states (empty, full, partial data)
-- Different browsers/devices if applicable
-- Different time scenarios (peak hours, off-hours)
-- Various network conditions if applicable
-
 COVERAGE DISTRIBUTION (${testCasesCount} unique tests):
-- Happy Path Variations: ${Math.ceil(testCasesCount * 0.35)} tests
-- Input Validation (different types): ${Math.ceil(testCasesCount * 0.25)} tests  
-- Error Handling (various scenarios): ${Math.ceil(testCasesCount * 0.20)} tests
-- Edge Cases & Boundaries: ${Math.ceil(testCasesCount * 0.15)} tests
-- Integration & Workflow: ${Math.ceil(testCasesCount * 0.05)} tests
+${distributionMap[level] || distributionMap['Medium']}
 
 UNIQUENESS STRATEGIES:
 - Use different submodules for similar functionality
@@ -300,14 +347,198 @@ Return ONLY the JSON array with ${testCasesCount} absolutely unique test cases.
 `;
 }
 
+export function analyzeScenarioGaps(existingScenarios, module, acceptanceCriteria) {
+    if (!existingScenarios || existingScenarios.length === 0) {
+        return {
+            hasGaps: false,
+            gapAnalysis: "No existing scenarios found",
+            missingScenarios: []
+        };
+    }
+
+    // Extract covered functionality from existing scenarios
+    const coveredFunctionality = new Set();
+    const existingConditions = existingScenarios.map(scenario => scenario.condition.toLowerCase());
+    
+    existingScenarios.forEach(scenario => {
+        const condition = scenario.condition.toLowerCase();
+        const description = scenario.testScenarios.toLowerCase();
+        
+        // Extract key functional areas
+        const functionalKeywords = extractFunctionalKeywords(condition + " " + description);
+        functionalKeywords.forEach(keyword => coveredFunctionality.add(keyword));
+    });
+
+    // Define essential scenarios for the module based on acceptance criteria
+    const essentialScenarios = generateEssentialScenariosMap(module, acceptanceCriteria);
+    
+    // Find missing essential scenarios
+    const missingScenarios = essentialScenarios.filter(essential => {
+        return !Array.from(coveredFunctionality).some(covered => 
+            essential.keywords.some(keyword => covered.includes(keyword))
+        );
+    });
+
+    return {
+        hasGaps: missingScenarios.length > 0,
+        gapAnalysis: `Found ${missingScenarios.length} missing essential scenarios out of ${essentialScenarios.length} core functionalities`,
+        missingScenarios,
+        coveredFunctionality: Array.from(coveredFunctionality),
+        existingConditions
+    };
+}
+
+// Helper: Extract functional keywords from scenario text
+function extractFunctionalKeywords(text) {
+    const functionalPatterns = [
+        'login', 'register', 'signup', 'authentication', 'verification',
+        'password', 'reset', 'forgot', 'change', 'update',
+        'logout', 'session', 'expire', 'timeout',
+        'create', 'add', 'insert', 'new',
+        'edit', 'modify', 'update', 'change',
+        'delete', 'remove', 'cancel',
+        'search', 'find', 'filter', 'sort',
+        'upload', 'download', 'import', 'export',
+        'validate', 'verify', 'confirm',
+        'error', 'fail', 'invalid', 'wrong',
+        'success', 'valid', 'correct',
+        'permission', 'access', 'role', 'admin'
+    ];
+
+    const keywords = [];
+    functionalPatterns.forEach(pattern => {
+        if (text.includes(pattern)) {
+            keywords.push(pattern);
+        }
+    });
+
+    return keywords;
+}
+
+// Helper: Generate essential scenarios map based on module and acceptance criteria
+function generateEssentialScenariosMap(module, acceptanceCriteria) {
+    const moduleMap = {
+        'user authentication': [
+            { scenario: 'successful_login', keywords: ['login', 'valid', 'success'] },
+            { scenario: 'failed_login', keywords: ['login', 'invalid', 'fail'] },
+            { scenario: 'registration', keywords: ['register', 'signup', 'new'] },
+            { scenario: 'password_reset', keywords: ['password', 'reset', 'forgot'] },
+            { scenario: 'logout', keywords: ['logout', 'signout'] },
+            { scenario: 'session_management', keywords: ['session', 'expire', 'timeout'] }
+        ],
+        'payment gateway': [
+            { scenario: 'successful_payment', keywords: ['payment', 'success', 'complete'] },
+            { scenario: 'failed_payment', keywords: ['payment', 'fail', 'decline'] },
+            { scenario: 'refund', keywords: ['refund', 'cancel', 'return'] },
+            { scenario: 'card_validation', keywords: ['card', 'validate', 'verify'] }
+        ],
+        'file management': [
+            { scenario: 'file_upload', keywords: ['upload', 'file', 'add'] },
+            { scenario: 'file_download', keywords: ['download', 'file', 'get'] },
+            { scenario: 'file_delete', keywords: ['delete', 'remove', 'file'] },
+            { scenario: 'file_search', keywords: ['search', 'find', 'file'] }
+        ],
+        'user management': [
+            { scenario: 'create_user', keywords: ['create', 'user', 'new'] },
+            { scenario: 'edit_user', keywords: ['edit', 'update', 'user'] },
+            { scenario: 'delete_user', keywords: ['delete', 'remove', 'user'] },
+            { scenario: 'user_permissions', keywords: ['permission', 'role', 'access'] }
+        ]
+    };
+
+    // Get module-specific scenarios or generate generic ones
+    const moduleKey = module.toLowerCase();
+    let essentialScenarios = moduleMap[moduleKey] || [];
+
+    // If no specific module mapping, extract from acceptance criteria
+    if (essentialScenarios.length === 0) {
+        essentialScenarios = extractScenariosFromCriteria(acceptanceCriteria);
+    }
+
+    return essentialScenarios;
+}
+
+// Helper: Extract scenarios from acceptance criteria
+function extractScenariosFromCriteria(acceptanceCriteria) {
+    const criteria = acceptanceCriteria.toLowerCase();
+    const scenarios = [];
+
+    // Common patterns in acceptance criteria
+    const patterns = [
+        { condition: criteria.includes('user') && criteria.includes('login'), scenario: 'user_login', keywords: ['login', 'user'] },
+        { condition: criteria.includes('create') || criteria.includes('add'), scenario: 'create_functionality', keywords: ['create', 'add'] },
+        { condition: criteria.includes('edit') || criteria.includes('update'), scenario: 'edit_functionality', keywords: ['edit', 'update'] },
+        { condition: criteria.includes('delete') || criteria.includes('remove'), scenario: 'delete_functionality', keywords: ['delete', 'remove'] },
+        { condition: criteria.includes('search') || criteria.includes('find'), scenario: 'search_functionality', keywords: ['search', 'find'] },
+        { condition: criteria.includes('validate') || criteria.includes('verify'), scenario: 'validation', keywords: ['validate', 'verify'] },
+        { condition: criteria.includes('error') || criteria.includes('fail'), scenario: 'error_handling', keywords: ['error', 'fail'] }
+    ];
+
+    patterns.forEach(pattern => {
+        if (pattern.condition) {
+            scenarios.push({ scenario: pattern.scenario, keywords: pattern.keywords });
+        }
+    });
+
+    return scenarios;
+}
+
+export function createGapFillingTestScenariosPrompt(module, summary, acceptanceCriteria, gapAnalysis, existingContext) {
+    if (!gapAnalysis.hasGaps) {
+        return null; // No gaps, no need to generate
+    }
+
+    const gapCount = Math.min(gapAnalysis.missingScenarios.length, 5); // Limit to 5 gap scenarios
+
+    return `
+Generate ${gapCount} LOW-LEVEL test scenarios for: ${module}
+PURPOSE: Fill gaps in existing test coverage
+
+Summary: ${summary}
+Acceptance Criteria: ${acceptanceCriteria}
+
+EXISTING COVERAGE ANALYSIS:
+${existingContext}
+
+GAP ANALYSIS:
+${gapAnalysis.gapAnalysis}
+
+MISSING ESSENTIAL SCENARIOS:
+${gapAnalysis.missingScenarios.map(gap => `- ${gap.scenario}: Focus on ${gap.keywords.join(', ')}`).join('\n')}
+
+ALREADY COVERED (DO NOT DUPLICATE):
+${gapAnalysis.existingConditions.map(condition => `- ${condition}`).join('\n')}
+
+REQUIREMENTS FOR GAP-FILLING:
+1. Generate ONLY scenarios that fill the identified gaps
+2. Focus on LOW-LEVEL essential functionality missing from existing scenarios
+3. Each scenario must address one of the missing essential functionalities
+4. Keep scenarios simple and focused (LOW level coverage)
+5. NO duplicates with existing conditions
+6. NO overlapping functionality with existing scenarios
+
+JSON Format:
+[
+  {
+    "id": "TS_GAP_1",
+    "module": "${module}",
+    "condition": "Missing functionality condition",
+    "testScenarios": "Simple gap-filling scenario description",
+    "status": "Not Tested"
+  }
+]
+
+CRITICAL: Only generate scenarios that fill actual gaps. Return ONLY JSON array with ${gapCount} gap-filling scenarios.
+`;
+}
+
 // ENHANCED: Update the main generation function to use these improvements
-export function updateGenerateTestCasesPrompt(module, summary, acceptanceCriteria, testCasesCount, existingTestCasesContext, nextIdNumber) {
-    // Use the enhanced context and anti-duplicate prompt
+export function updateGenerateTestCasesPrompt(module, summary, acceptanceCriteria, level, existingTestCasesContext, nextIdNumber) {
     return createAntiDuplicatePrompt(
         module, 
         summary, 
         acceptanceCriteria, 
-        testCasesCount, 
+        level, 
         nextIdNumber, 
         existingTestCasesContext
     );
@@ -316,10 +547,10 @@ export function updateGenerateTestCasesPrompt(module, summary, acceptanceCriteri
 // ENHANCED: Improved validation with stronger duplicate detection
 export function validateAndCleanTestCasesEnhanced(testCases, existingTestCases = []) {
     console.log(`🔍 Starting enhanced validation for ${testCases.length} generated test cases`);
-    
+
     // Combine new and existing test cases for comprehensive duplicate checking
     const allExistingCases = existingTestCases || [];
-    
+
     const cleaned = testCases.map((tc, index) => {
         let steps = tc.testSteps || tc.steps;
         if (Array.isArray(steps)) {
@@ -437,12 +668,12 @@ function extractTestPurpose(summary) {
         'login', 'create', 'update', 'delete', 'search', 'upload',
         'download', 'submit', 'cancel', 'save', 'edit', 'view'
     ];
-    
+
     const words = summary.toLowerCase().split(/\s+/);
-    const purposeWords = words.filter(word => 
+    const purposeWords = words.filter(word =>
         purposeKeywords.includes(word) || word.length > 4
     );
-    
+
     return purposeWords.slice(0, 5).join(' ');
 }
 
@@ -461,11 +692,11 @@ function calculateAdvancedSimilarity(str1, str2) {
 
     // Jaccard similarity
     const jaccardSimilarity = intersection.size / union.size;
-    
+
     // Add penalty for common action words appearing in same order
     const actionWords = ['login', 'create', 'update', 'delete', 'verify', 'validate'];
     let actionPenalty = 0;
-    
+
     actionWords.forEach(action => {
         if (str1.includes(action) && str2.includes(action)) {
             actionPenalty += 0.1;
@@ -478,23 +709,23 @@ function calculateAdvancedSimilarity(str1, str2) {
 // HELPER: Calculate purpose similarity
 function calculatePurposeSimilarity(purpose1, purpose2) {
     if (!purpose1 || !purpose2) return 0;
-    
+
     const words1 = purpose1.split(' ');
     const words2 = purpose2.split(' ');
-    
+
     const commonWords = words1.filter(word => words2.includes(word));
     const totalWords = new Set([...words1, ...words2]).size;
-    
+
     return commonWords.length / totalWords;
 }
 
 // Replace parseGeminiJSON validation call with enhanced version
 export function parseGeminiJSONEnhanced(text, existingTestCases = []) {
     console.log("🔍 Starting enhanced JSON parsing...");
-    
+
     // Use existing parsing logic first
     const parsed = parseGeminiJSON(text);
-    
+
     // Then apply enhanced validation
     return performPostGenerationValidation(parsed, existingTestCases);
 }
@@ -502,29 +733,29 @@ export function parseGeminiJSONEnhanced(text, existingTestCases = []) {
 // ENHANCED: Post-generation validation
 export function performPostGenerationValidation(generatedTestCases, existingTestCases = []) {
     console.log("🔍 Performing post-generation validation...");
-    
+
     // Use enhanced validation
     const validatedCases = validateAndCleanTestCasesEnhanced(generatedTestCases, existingTestCases);
-    
+
     // Additional checks
     if (validatedCases.length < generatedTestCases.length * 0.7) {
         console.warn(`⚠️ High duplicate rate detected. Only ${validatedCases.length} unique cases from ${generatedTestCases.length} generated.`);
     }
-    
+
     // Check for variety in submodules
     const submodules = [...new Set(validatedCases.map(tc => tc.submodule))];
     if (submodules.length < 3) {
         console.warn(`⚠️ Low submodule variety. Consider more diverse test scenarios.`);
     }
-    
+
     // Check test type distribution
     const positiveCount = validatedCases.filter(tc => tc.testCaseType === 'Positive').length;
     const negativeCount = validatedCases.filter(tc => tc.testCaseType === 'Negative').length;
-    
+
     if (positiveCount === 0 || negativeCount === 0) {
         console.warn(`⚠️ Unbalanced test types: ${positiveCount} positive, ${negativeCount} negative`);
     }
-    
+
     return validatedCases;
 }
 

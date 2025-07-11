@@ -7,9 +7,7 @@ import {
     updateSpreadsheetWithArrangement,
     createCompactTestCasesContext,
     createCompactTestScenariosContext,
-    parseGeminiJSON,
     parseTestScenariosJSON,
-    validateAndCleanTestCases,
     callGeminiWithRetry,
     appendTestCasesToExistingSheet,
     appendTestScenariosToExistingSheet,
@@ -23,6 +21,20 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+
+const TEST_CASE_LEVELS = {
+    'Low': { min: 1, max: 5, focus: 'Critical paths only', coverage: 'Happy path + 1-2 critical negatives' },
+    'Medium': { min: 5, max: 15, focus: 'Core functionality + key negatives', coverage: 'Main workflows + input validation + error handling' },
+    'High': { min: 15, max: 25, focus: 'Comprehensive coverage + edge cases', coverage: 'All user paths + boundary testing + integration scenarios' },
+    'Detailed': { min: 25, max: 40, focus: 'Exhaustive testing + all scenarios', coverage: 'All permutations + stress testing + complex workflows' }
+};
+
+const TEST_SCENARIO_LEVELS = {
+    'Low': { min: 1, max: 3, focus: 'Happy path workflows', coverage: 'Primary success scenarios' },
+    'Medium': { min: 3, max: 8, focus: 'Core workflows + error paths', coverage: 'Success + failure workflows + recovery paths' },
+    'High': { min: 8, max: 15, focus: 'Complete user journeys', coverage: 'All user types + complex scenarios + integrations' },
+    'Detailed': { min: 15, max: 25, focus: 'All possible workflows + integrations', coverage: 'Every possible path + system integrations + edge workflows' }
+};
 
 export const getTestCases = async (req, res) => {
     try {
@@ -471,15 +483,17 @@ export const generateTestCasesWithOptions = async (req, res) => {
             spreadsheetId,
             generateTestCases = true,
             generateTestScenarios = true,
-            testCasesCount = 20,
-            testScenariosCount = 10,
+            testCasesLevel = 'Medium',        // CHANGED: from testCasesCount
+            testScenariosLevel = 'Medium',    // CHANGED: from testScenariosCount
             testCasesSheetName = null,
             testScenariosSheetName = null
         } = req.body;
 
         const userId = req.user._id.toString();
         console.log("🔧 Generate with options for user:", userId);
-        console.log(`📊 Requested: ${testCasesCount} test cases, ${testScenariosCount} scenarios`);
+
+        // CHANGED: Log levels instead of counts
+        console.log(`📊 Requested: ${testCasesLevel} level test cases, ${testScenariosLevel} level scenarios`);
 
         // Validate input
         if (!module || !summary || !acceptanceCriteria) {
@@ -542,6 +556,7 @@ export const generateTestCasesWithOptions = async (req, res) => {
         // OPTIMIZED: Get existing test scenarios context (lightweight)
         if (generateTestScenarios && testScenariosSheetName && testScenariosSheetName.trim()) {
             try {
+                // Analyze gaps in existing scenarios
                 const existingResponse = await sheets.spreadsheets.values.get({
                     spreadsheetId,
                     range: `'${testScenariosSheetName.trim()}'!A:D`,
@@ -549,22 +564,60 @@ export const generateTestCasesWithOptions = async (req, res) => {
 
                 const existingRows = existingResponse.data.values || [];
                 if (existingRows.length > 1) {
-                    // OPTIMIZED: Extract only essential fields
                     const existingTestScenarios = existingRows.slice(1).map((row, index) => ({
                         condition: row[1] || '',
                         testScenarios: row[2] || ''
                     })).filter(ts => ts.testScenarios);
 
                     if (existingTestScenarios.length > 0) {
-                        existingTestScenariosContext = createCompactTestScenariosContext(existingTestScenarios, testScenariosSheetName);
+                        console.log(`🔍 Analyzing gaps in ${existingTestScenarios.length} existing scenarios...`);
+
+                        // Analyze what's missing
+                        const gapAnalysis = analyzeScenarioGaps(existingTestScenarios, module, acceptanceCriteria);
+
+                        if (gapAnalysis.hasGaps) {
+                            console.log(`📋 Found gaps: ${gapAnalysis.gapAnalysis}`);
+
+                            // Generate gap-filling scenarios
+                            const gapPrompt = createGapFillingTestScenariosPrompt(
+                                module,
+                                summary,
+                                acceptanceCriteria,
+                                gapAnalysis,
+                                existingTestScenariosContext
+                            );
+
+                            if (gapPrompt) {
+                                console.log("🤖 Generating gap-filling scenarios...");
+                                const gapScenariosText = await callGeminiWithRetry(model, gapPrompt, 3, 2000);
+                                const gapScenarios = parseTestScenariosJSON(gapScenariosText);
+
+                                if (gapScenarios.length > 0) {
+                                    console.log(`✅ Generated ${gapScenarios.length} gap-filling scenarios`);
+
+                                    // Append gap scenarios to the main scenarios
+                                    testScenarios = [...testScenarios, ...gapScenarios];
+
+                                    // Update created sheets info
+                                    const existingSheetInfo = createdSheets.find(s => s.type === 'testScenarios');
+                                    if (existingSheetInfo) {
+                                        existingSheetInfo.count += gapScenarios.length;
+                                        existingSheetInfo.gapsFilled = gapScenarios.length;
+                                    }
+                                }
+                            }
+                        } else {
+                            console.log("✅ No gaps found in existing scenarios - good coverage!");
+                        }
                     }
                 }
             } catch (error) {
-                console.log("⚠️ Could not fetch existing test scenarios context:", error.message);
+                console.log("⚠️ Could not analyze scenario gaps:", error.message);
             }
         }
 
-        // ENHANCED: Generate Test Cases with enhanced duplicate prevention
+
+        // ENHANCED: Generate Test Cases with level-based approach
         if (generateTestCases) {
             let nextIdNumber = 1;
             let existingTestCasesForValidation = [];
@@ -599,18 +652,18 @@ export const generateTestCasesWithOptions = async (req, res) => {
                 }
             }
 
-            // ENHANCED: Use the improved prompt
+            // CHANGED: Use level-based prompt instead of count-based
             const testCasesPrompt = updateGenerateTestCasesPrompt(
                 module,
                 summary,
                 acceptanceCriteria,
-                testCasesCount,
+                testCasesLevel,        // CHANGED: from testCasesCount
                 existingTestCasesContext,
                 nextIdNumber
             );
 
             try {
-                console.log("🤖 Generating test cases with enhanced duplicate prevention...");
+                console.log(`🤖 Generating ${testCasesLevel} level test cases with enhanced duplicate prevention...`);
                 const testCasesText = await callGeminiWithRetry(model, testCasesPrompt, 3, 2000);
 
                 // ENHANCED: Use enhanced parsing and validation
@@ -653,6 +706,7 @@ export const generateTestCasesWithOptions = async (req, res) => {
                         type: 'testCases',
                         name: finalTestCasesSheetName,
                         count: testCases.length,
+                        level: testCasesLevel,        // CHANGED: added level info
                         action: testCasesSheetName ? 'appended' : 'created'
                     });
                 }
@@ -682,15 +736,23 @@ export const generateTestCasesWithOptions = async (req, res) => {
             }
         }
 
-        // OPTIMIZED: Generate Test Scenarios with lightweight prompt  
+        // ENHANCED: Generate Test Scenarios with level-based approach  
         if (generateTestScenarios) {
-            // OPTIMIZED: Much shorter prompt
+            // CHANGED: Calculate count from level
+            const levelConfig = TEST_SCENARIO_LEVELS[testScenariosLevel] || TEST_SCENARIO_LEVELS['Medium'];
+            const testScenariosCount = Math.round((levelConfig.min + levelConfig.max) / 2);
+
+            // OPTIMIZED: Level-based prompt
             const testScenariosPrompt = `
 Generate ${testScenariosCount} test scenarios for: ${module}
+SCENARIO LEVEL: ${testScenariosLevel.toUpperCase()} (${levelConfig.focus})
 
 Summary: ${summary}
 Acceptance Criteria: ${acceptanceCriteria}
 ${existingTestScenariosContext ? `\nExisting Context:\n${existingTestScenariosContext}` : ''}
+
+LEVEL REQUIREMENTS:
+Coverage: ${levelConfig.coverage}
 
 Requirements:
 - Create different conditions/workflows than existing
@@ -712,7 +774,7 @@ Return ONLY JSON array with ${testScenariosCount} scenarios.
 `;
 
             try {
-                console.log("🤖 Generating test scenarios...");
+                console.log(`🤖 Generating ${testScenariosLevel} level test scenarios...`);
                 const testScenariosText = await callGeminiWithRetry(model, testScenariosPrompt, 3, 2000);
                 testScenarios = parseTestScenariosJSON(testScenariosText);
 
@@ -751,6 +813,7 @@ Return ONLY JSON array with ${testScenariosCount} scenarios.
                         type: 'testScenarios',
                         name: finalTestScenariosSheetName,
                         count: testScenarios.length,
+                        level: testScenariosLevel,   // CHANGED: added level info
                         action: testScenariosSheetName ? 'appended' : 'created'
                     });
                 }
@@ -787,7 +850,8 @@ Return ONLY JSON array with ${testScenariosCount} scenarios.
             testCases: generateTestCases ? testCases : [],
             testScenarios: generateTestScenarios ? testScenarios : [],
             createdSheets,
-            message: `Successfully ${createdSheets.map(s => `${s.action} ${s.count} ${s.type === 'testCases' ? 'test cases' : 'test scenarios'} ${s.action === 'appended' ? 'to' : 'in'} "${s.name}"`).join(' and ')}`
+            // CHANGED: Updated message to include level info
+            message: `Successfully ${createdSheets.map(s => `${s.action} ${s.count} ${s.level} level ${s.type === 'testCases' ? 'test cases' : 'test scenarios'} ${s.action === 'appended' ? 'to' : 'in'} "${s.name}"`).join(' and ')}`
         });
 
     } catch (error) {
